@@ -1,0 +1,164 @@
+name: 运行 Microsoft Rewards
+
+# 本工作流按计划（以及按需）运行 Microsoft Rewards 脚本。
+# 它不运行存储本工作流文件的仓库代码，
+# 而是检出 zhangMonday/Microsoft-Rewards-Script@v4 并运行。
+#
+# 所需的 secrets/variables 详见 .github/workflows/README.md。
+
+on:
+    # 手动触发，支持运行时覆盖参数。
+    workflow_dispatch:
+        inputs:
+            debug_logs:
+                description: '强制本次运行启用 debugLogs=true'
+                type: boolean
+                default: false
+            run_on_zero_points:
+                description: '强制本次运行启用 searchSettings.runOnZeroPoints=true'
+                type: boolean
+                default: false
+    # 定时运行。Cron 为 UTC 时间。默认：每天 UTC 07:11 和 19:11。
+    # 编辑/添加行以更改计划。
+    schedule:
+        - cron: '11 7 * * *'
+        - cron: '11 19 * * *'
+
+# 不同时运行两个 rewards 任务（sessions.db 会冲突）。
+concurrency:
+    group: run-microsoft-rewards
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+jobs:
+    run:
+        name: 运行 rewards
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+
+        env:
+            # 实际运行的源仓库（不是存储本工作流的仓库）。
+            SOURCE_REPO: zhangMonday/Microsoft-Rewards-Script
+            SOURCE_REF: v4
+
+        steps:
+            # 1. 检出源仓库，而非当前仓库。
+            - name: 检出源仓库
+              uses: actions/checkout@v7
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ env.SOURCE_REF }}
+                  # 用于源仓库的 PAT，需具有 'repo' 范围（经典）或细粒度 Contents: Read 权限。
+                  token: ${{ secrets.SOURCE_REPO_TOKEN }}
+                  persist-credentials: false
+
+            # 2. Node.js 24（脚本的 package.json engines 字段要求）。
+            - name: 设置 Node.js
+              uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+                  cache: npm
+
+            # 3. 安装依赖（跳过生命周期脚本；浏览器将单独安装）。
+            - name: 安装依赖
+              run: npm ci --ignore-scripts
+
+            # 4. 在运行间缓存 Patchright/Chromium 浏览器下载。
+            - name: 缓存 Patchright 浏览器
+              id: browser-cache
+              uses: actions/cache@v4
+              with:
+                  path: ~/.cache/ms-playwright
+                  key: patchright-chromium-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+                  restore-keys: |
+                      patchright-chromium-${{ runner.os }}-
+
+            - name: 安装 Chromium（含系统依赖）
+              run: npx patchright install --with-deps chromium
+
+            # 5. 从上次运行恢复登录会话，避免重复 2FA/登录。
+            #    缓存以运行编号为键，每次运行写入新条目以便恢复最新会话。
+            - name: 恢复会话
+              id: sessions-cache
+              uses: actions/cache@v4
+              with:
+                  path: sessions
+                  key: msr-sessions-${{ github.run_id }}
+                  restore-keys: |
+                      msr-sessions-
+
+            # 6. 将账户凭据从 ACCOUNTS_ENV secret 写入 .env。
+            #    ACCOUNTS_ENV 包含完整的 .env 文件内容（ACCOUNT_1_EMAIL=... 等）。
+            - name: 写入 .env
+              env:
+                  ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
+              run: |
+                  if [ -z "$ACCOUNTS_ENV" ]; then
+                    echo "::error::Secret ACCOUNTS_ENV 为空。请添加 ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD（等）到其中。"
+                    exit 1
+                  fi
+                  printf '%s\n' "$ACCOUNTS_ENV" > .env
+                  echo "已写入 .env，共 $(grep -c '_EMAIL=' .env || true) 个账户邮箱行。"
+
+            # 7. 构建 config.json。
+            #    - 如果设置了 CONFIG_JSON variable/secret，则原样使用（支持所有配置选项）。
+            #    - 否则使用仓库的 config.example.json 作为基础。
+            #    然后强制设置 CI 中必须不同的参数（headless、diagnostics），
+            #    并应用可选的 workflow_dispatch 覆盖参数。
+            - name: 构建 config.json
+              env:
+                  CONFIG_JSON: ${{ vars.CONFIG_JSON != '' && vars.CONFIG_JSON || secrets.CONFIG_JSON }}
+                  INPUT_DEBUG_LOGS: ${{ inputs.debug_logs }}
+                  INPUT_RUN_ON_ZERO_POINTS: ${{ inputs.run_on_zero_points }}
+              run: |
+                  set -euo pipefail
+                  if [ -n "${CONFIG_JSON:-}" ]; then
+                    printf '%s' "$CONFIG_JSON" > config.json
+                    echo "使用来自仓库 variable/secret 的 CONFIG_JSON。"
+                  else
+                    cp config.example.json config.json
+                    echo "未设置 CONFIG_JSON；使用 config.example.json 作为基础。"
+                  fi
+
+                  # 提前验证 JSON 格式。
+                  jq empty config.json
+
+                  # 在运行器上 headless 必须为 true（无显示服务器）。
+                  tmp=$(mktemp)
+                  jq '.headless = true | .errorDiagnostics = true' config.json > "$tmp" && mv "$tmp" config.json
+
+                  if [ "${INPUT_DEBUG_LOGS}" = "true" ]; then
+                    jq '.debugLogs = true' config.json > "$tmp" && mv "$tmp" config.json
+                  fi
+                  if [ "${INPUT_RUN_ON_ZERO_POINTS}" = "true" ]; then
+                    jq '.searchSettings.runOnZeroPoints = true' config.json > "$tmp" && mv "$tmp" config.json
+                  fi
+
+            # 8. 构建并运行。
+            - name: 构建
+              run: npm run build
+
+            - name: 运行 Microsoft Rewards 脚本
+              run: npm start
+
+            # 9. 持久化更新后的会话以供下次运行使用。
+            - name: 保存会话
+              if: always()
+              uses: actions/cache/save@v4
+              with:
+                  path: sessions
+                  key: msr-sessions-${{ github.run_id }}
+
+            # 10. 上传诊断/日志文件用于故障排查（保留 7 天）。
+            - name: 上传诊断信息
+              if: always()
+              uses: actions/upload-artifact@v6
+              with:
+                  name: rewards-diagnostics-${{ github.run_id }}
+                  path: |
+                      diagnostics/
+                      *.log
+                  if-no-files-found: ignore
+                  retention-days: 7

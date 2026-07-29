@@ -68,7 +68,7 @@ jobs:
             # 4. 在运行间缓存 Patchright/Chromium 浏览器下载。
             - name: 缓存 Patchright 浏览器
               id: browser-cache
-              uses: actions/cache@v4
+              uses: actions/cache@v6
               with:
                   path: ~/.cache/ms-playwright
                   key: patchright-chromium-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
@@ -82,7 +82,7 @@ jobs:
             #    缓存以运行编号为键，每次运行写入新条目以便恢复最新会话。
             - name: 恢复会话
               id: sessions-cache
-              uses: actions/cache@v4
+              uses: actions/cache@v6
               with:
                   path: sessions
                   key: msr-sessions-${{ github.run_id }}
@@ -146,7 +146,7 @@ jobs:
             # 9. 持久化更新后的会话以供下次运行使用。
             - name: 保存会话
               if: always()
-              uses: actions/cache/save@v4
+              uses: actions/cache/save@v6
               with:
                   path: sessions
                   key: msr-sessions-${{ github.run_id }}

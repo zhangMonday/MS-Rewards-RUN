@@ -1,4 +1,4 @@
-name: debug Microsoft Rewards
+name: debug Microsoft Rewards(仅登录)
 
 # 本工作流按计划（以及按需）运行 Microsoft Rewards 脚本。
 # 它不运行存储本工作流文件的仓库代码，

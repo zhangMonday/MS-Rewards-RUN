@@ -49,6 +49,26 @@ jobs:
                   token: ${{ secrets.SOURCE_REPO_TOKEN }}
                   persist-credentials: false
 
+            - name: 设置时区为北京时间
+              run: |
+                  sudo timedatectl set-timezone Asia/Shanghai
+                  echo "当前时间: $(date)"
+
+            - name: 下载中文字体
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y fonts-wqy-zenhei
+
+            - name: 安装Xvfb虚拟显示器
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y xvfb
+
+            - name: 启动虚拟显示器
+              run: |
+                  Xvfb :99 -screen 0 1024x768x24 &
+                  echo "DISPLAY=:99" >> $GITHUB_ENV
+
             # 2. Node.js 24（脚本的 package.json engines 字段要求）。
             - name: 设置 Node.js
               uses: actions/setup-node@v7
@@ -120,9 +140,9 @@ jobs:
                   # 提前验证 JSON 格式。
                   jq empty config.json
 
-                  # 在运行器上 headless 必须为 true（无显示服务器）。
+                  # 保留 config.json 中的 headless 设置；Xvfb 仅提供可选的虚拟显示环境。
                   tmp=$(mktemp)
-                  jq '.headless = true | .errorDiagnostics = true' config.json > "$tmp" && mv "$tmp" config.json
+                  jq '.errorDiagnostics = true' config.json > "$tmp" && mv "$tmp" config.json
 
                   if [ "${INPUT_DEBUG_LOGS}" = "true" ]; then
                     jq '.debugLogs = true' config.json > "$tmp" && mv "$tmp" config.json

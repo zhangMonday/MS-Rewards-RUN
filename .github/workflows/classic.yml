@@ -56,12 +56,12 @@ jobs:
                   # 每 5 个账号一个 job，向上取整，数量不设上限。
                   SHARDS=$(( (TOTAL + 4) / 5 ))
                   echo "账号总数: ${TOTAL}，分片（job）数: ${SHARDS}"
-                  SHARDS_JSON=$(jq -cn --argjson n "$SHARDS" '[range(0; $n)]')
+                  SHARDS_JSON=$(jq -cn --argjson n "$SHARDS" '[range(0; $n) | {shard: ., display: "\(.+1)/\($n)"}]')
                   echo "shards=${SHARDS_JSON}" >> "$GITHUB_OUTPUT"
                   echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
 
     run:
-        name: 运行 rewards（分片 ${{ strategy.job-index + 1 }}/${{ strategy.job-total }}）
+        name: 运行 rewards（分片 ${{ matrix.chunk.display }}）
         needs: prepare
         runs-on: ubuntu-latest
         timeout-minutes: 60
@@ -70,7 +70,7 @@ jobs:
             # 某个分片失败不影响其他分片继续执行。
             fail-fast: false
             matrix:
-                shard: ${{ fromJSON(needs.prepare.outputs.shards) }}
+                chunk: ${{ fromJSON(needs.prepare.outputs.shards) }}
 
         env:
             # 实际运行的源仓库（不是存储本工作流的仓库）。
@@ -138,9 +138,9 @@ jobs:
               uses: actions/cache@v6
               with:
                   path: sessions
-                  key: msr-sessions-shard-${{ matrix.shard }}-${{ github.run_id }}
+                  key: msr-sessions-shard-${{ matrix.chunk.shard }}-${{ github.run_id }}
                   restore-keys: |
-                      msr-sessions-shard-${{ matrix.shard }}-
+                      msr-sessions-shard-${{ matrix.chunk.shard }}-
                       msr-sessions-
 
             # 6. 将账户凭据从 ACCOUNTS_ENV secret 写入 .env.full（完整账号列表）。
@@ -161,7 +161,7 @@ jobs:
             #     单分片（<=5 个账号）时不做拆分，与原有单 job 逻辑完全一致。
             - name: 按分片生成 .env
               env:
-                  SHARD: ${{ matrix.shard }}
+                  SHARD: ${{ matrix.chunk.shard }}
               run: |
                   set -euo pipefail
                   TOTAL=$(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
@@ -229,14 +229,14 @@ jobs:
               uses: actions/cache/save@v6
               with:
                   path: sessions
-                  key: msr-sessions-shard-${{ matrix.shard }}-${{ github.run_id }}
+                  key: msr-sessions-shard-${{ matrix.chunk.shard }}-${{ github.run_id }}
 
             # 10. 上传诊断/日志文件用于故障排查（保留 7 天）。
             - name: 上传诊断信息
               if: always()
               uses: actions/upload-artifact@v6
               with:
-                  name: rewards-diagnostics-${{ github.run_id }}-shard${{ matrix.shard }}
+                  name: rewards-diagnostics-${{ github.run_id }}-shard${{ matrix.chunk.shard }}
                   path: |
                       diagnostics/
                       *.log

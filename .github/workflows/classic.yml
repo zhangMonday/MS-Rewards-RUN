@@ -28,10 +28,49 @@ permissions:
     contents: read
 
 jobs:
+    # 前置 job：统计 ACCOUNTS_ENV 中的账号数量，按每 5 个账号一片计算分片数，
+    # 输出动态 matrix，供 run job 并行执行。<=5 个账号时只输出 1 个分片，行为不变。
+    prepare:
+        name: 计算账号分片
+        runs-on: ubuntu-latest
+        outputs:
+            shards: ${{ steps.split.outputs.shards }}
+            total: ${{ steps.split.outputs.total }}
+        steps:
+            - name: 统计账号数量并生成分片矩阵
+              id: split
+              env:
+                  ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "${ACCOUNTS_ENV:-}" ]; then
+                    echo "::error::Secret ACCOUNTS_ENV 为空。请添加 ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD（等）到其中。"
+                    exit 1
+                  fi
+                  printf '%s\n' "$ACCOUNTS_ENV" > .env.full
+                  TOTAL=$(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
+                  if [ "$TOTAL" -eq 0 ]; then
+                    echo "::error::ACCOUNTS_ENV 中未找到任何 ACCOUNT_N_EMAIL 配置。"
+                    exit 1
+                  fi
+                  # 每 5 个账号一个 job，向上取整，数量不设上限。
+                  SHARDS=$(( (TOTAL + 4) / 5 ))
+                  echo "账号总数: ${TOTAL}，分片（job）数: ${SHARDS}"
+                  SHARDS_JSON=$(jq -cn --argjson n "$SHARDS" '[range(0; $n)]')
+                  echo "shards=${SHARDS_JSON}" >> "$GITHUB_OUTPUT"
+                  echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+
     run:
-        name: 运行 rewards
+        name: 运行 rewards（分片 ${{ strategy.job-index }}/${{ strategy.job-total }}）
+        needs: prepare
         runs-on: ubuntu-latest
         timeout-minutes: 60
+
+        strategy:
+            # 某个分片失败不影响其他分片继续执行。
+            fail-fast: false
+            matrix:
+                shard: ${{ fromJSON(needs.prepare.outputs.shards) }}
 
         env:
             # 实际运行的源仓库（不是存储本工作流的仓库）。
@@ -92,19 +131,21 @@ jobs:
               run: npx patchright install --with-deps chromium
 
             # 5. 从上次运行恢复登录会话，避免重复 2FA/登录。
-            #    缓存以运行编号为键，每次运行写入新条目以便恢复最新会话。
+            #    缓存以运行编号 + 分片号为键，每个分片（job）独立读写自己的会话缓存，
+            #    避免并行分片之间互相覆盖；并兼容恢复旧的未分片缓存。
             - name: 恢复会话
               id: sessions-cache
               uses: actions/cache@v6
               with:
                   path: sessions
-                  key: msr-sessions-${{ github.run_id }}
+                  key: msr-sessions-shard-${{ matrix.shard }}-${{ github.run_id }}
                   restore-keys: |
+                      msr-sessions-shard-${{ matrix.shard }}-
                       msr-sessions-
 
-            # 6. 将账户凭据从 ACCOUNTS_ENV secret 写入 .env。
+            # 6. 将账户凭据从 ACCOUNTS_ENV secret 写入 .env.full（完整账号列表）。
             #    ACCOUNTS_ENV 包含完整的 .env 文件内容（ACCOUNT_1_EMAIL=... 等）。
-            - name: 写入 .env
+            - name: 写入 .env.full
               env:
                   ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
               run: |
@@ -112,8 +153,34 @@ jobs:
                     echo "::error::Secret ACCOUNTS_ENV 为空。请添加 ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD（等）到其中。"
                     exit 1
                   fi
-                  printf '%s\n' "$ACCOUNTS_ENV" > .env
-                  echo "已写入 .env，共 $(grep -c '_EMAIL=' .env || true) 个账户邮箱行。"
+                  printf '%s\n' "$ACCOUNTS_ENV" > .env.full
+                  echo "已写入 .env.full，共 $(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true) 个账户邮箱行。"
+
+            # 6b. 按分片拆分账号配置：每个 job 只保留属于自己的账号（按邮箱行排序后每 5 个一片），
+            #     并重排为 ACCOUNT_1..N，非账号行（如 API_TOKEN 等其他配置）原样保留。
+            #     单分片（<=5 个账号）时不做拆分，与原有单 job 逻辑完全一致。
+            - name: 按分片生成 .env
+              env:
+                  SHARD: ${{ matrix.shard }}
+              run: |
+                  set -euo pipefail
+                  TOTAL=$(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
+                  SHARDS=$(( (TOTAL + 4) / 5 ))
+                  if [ "$SHARDS" -le 1 ]; then
+                    cp .env.full .env
+                    echo "账号数 ${TOTAL} <= 5，单 job 运行，.env 不做拆分。"
+                  else
+                    mapfile -t ACCTS < <(grep -oE '^ACCOUNT_[0-9]+_EMAIL=' .env.full | sed -E 's/^ACCOUNT_([0-9]+)_EMAIL=/\1/' | sort -nu)
+                    START=$((SHARD * 5))
+                    grep -vE '^ACCOUNT_[0-9]+_' .env.full > .env || true
+                    NEW=1
+                    for OLD in "${ACCTS[@]:$START:5}"; do
+                      grep -E "^ACCOUNT_${OLD}_" .env.full | sed -E "s/^ACCOUNT_${OLD}_/ACCOUNT_${NEW}_/" >> .env
+                      echo "  原账号槽位 ${OLD} -> 本 job 槽位 ${NEW}"
+                      NEW=$((NEW + 1))
+                    done
+                    echo "分片 $((SHARD + 1))/${SHARDS}：总账号 ${TOTAL} 个，本 job 负责 $((NEW - 1)) 个。"
+                  fi
 
             # 7. 构建 config.json。
             #    - 如果设置了 CONFIG_JSON variable/secret，则原样使用（支持所有配置选项）。
@@ -162,14 +229,14 @@ jobs:
               uses: actions/cache/save@v6
               with:
                   path: sessions
-                  key: msr-sessions-${{ github.run_id }}
+                  key: msr-sessions-shard-${{ matrix.shard }}-${{ github.run_id }}
 
             # 10. 上传诊断/日志文件用于故障排查（保留 7 天）。
             - name: 上传诊断信息
               if: always()
               uses: actions/upload-artifact@v6
               with:
-                  name: rewards-diagnostics-${{ github.run_id }}
+                  name: rewards-diagnostics-${{ github.run_id }}-shard${{ matrix.shard }}
                   path: |
                       diagnostics/
                       *.log

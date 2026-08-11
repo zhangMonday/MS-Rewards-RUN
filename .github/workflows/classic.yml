@@ -64,7 +64,6 @@ jobs:
         name: 运行 rewards（分片 ${{ matrix.chunk.display }}）
         needs: prepare
         runs-on: ubuntu-latest
-        timeout-minutes: 60
 
         strategy:
             # 某个分片失败不影响其他分片继续执行。

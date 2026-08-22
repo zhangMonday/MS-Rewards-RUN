@@ -5,9 +5,15 @@ name: 运行 Microsoft Rewards
 # 而是检出 zhangMonday/Microsoft-Rewards-Script@v4 并运行。
 #
 # 所需的 secrets/variables 详见 .github/workflows/README.md。
+#
+# 需要配置的 Secrets：
+#   ACCOUNTS_ENV
+#   SOURCE_REPO_TOKEN
+#   proxy_api
+#
+# proxy_api 的值应为完整的代理 API 地址。
 
 on:
-    # 手动触发，支持运行时覆盖参数。
     workflow_dispatch:
         inputs:
             debug_logs:
@@ -18,8 +24,7 @@ on:
                 description: '强制本次运行启用 searchSettings.runOnZeroPoints=true'
                 type: boolean
                 default: false
-    # 定时运行。Cron 为 UTC 时间。默认：每天 UTC 07:11 和 19:11。
-    # 编辑/添加行以更改计划。
+
     schedule:
         - cron: '11 7 * * *'
         - cron: '11 19 * * *'
@@ -33,37 +38,380 @@ permissions:
     contents: read
 
 jobs:
-    # 前置 job：统计 ACCOUNTS_ENV 中的账号数量，按每 5 个账号一片计算分片数，
-    # 输出动态 matrix，供 run job 并行执行。<=5 个账号时只输出 1 个分片，行为不变。
+    # 前置 job：
+    # 1. 统计账号数量并生成分片矩阵；
+    # 2. 获取代理；
+    # 3. 多线程测试代理；
+    # 4. 将代理结果传递给各个运行 job。
     prepare:
-        name: 计算账号分片
+        name: 计算账号分片和代理
         runs-on: ubuntu-latest
+
         outputs:
             shards: ${{ steps.split.outputs.shards }}
             total: ${{ steps.split.outputs.total }}
+            proxies: ${{ steps.split.outputs.proxies }}
+
         steps:
-            - name: 统计账号数量并生成分片矩阵
+            - name: 统计账号、测试代理并生成分片矩阵
               id: split
               env:
                   ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
+                  PROXY_API: ${{ secrets.proxy_api }}
               run: |
                   set -euo pipefail
+
                   if [ -z "${ACCOUNTS_ENV:-}" ]; then
-                    echo "::error::Secret ACCOUNTS_ENV 为空。请添加 ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD（等）到其中。"
+                    echo "::error::Secret ACCOUNTS_ENV 为空。请添加 ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD 等配置。"
                     exit 1
                   fi
+
                   printf '%s\n' "$ACCOUNTS_ENV" > .env.full
-                  TOTAL=$(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
+
+                  TOTAL=$(grep -cE '^[[:space:]]*ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
+
                   if [ "$TOTAL" -eq 0 ]; then
                     echo "::error::ACCOUNTS_ENV 中未找到任何 ACCOUNT_N_EMAIL 配置。"
                     exit 1
                   fi
-                  # 每 5 个账号一个 job，向上取整，数量不设上限。
+
                   SHARDS=$(( (TOTAL + 4) / 5 ))
-                  echo "账号总数: ${TOTAL}，分片（job）数: ${SHARDS}"
-                  SHARDS_JSON=$(jq -cn --argjson n "$SHARDS" '[range(0; $n) | {shard: ., display: "\(.+1)/\($n)"}]')
+
+                  echo "账号总数: ${TOTAL}"
+                  echo "分片（job）数: ${SHARDS}"
+
+                  SHARDS_JSON=$(jq -cn \
+                    --argjson n "$SHARDS" \
+                    '[range(0; $n) | {shard: ., display: "\(.+1)/\($n)"}]')
+
+                  python3 <<'PY'
+                  import concurrent.futures
+                  import ipaddress
+                  import json
+                  import os
+                  import re
+                  import subprocess
+                  import urllib.request
+
+                  ENV_FILE = ".env.full"
+                  OUTPUT_FILE = ".proxies.json"
+
+                  BAIDU_URL = "https://www.baidu.com/"
+                  TEST_TIMEOUT = 10
+                  MAX_WORKERS = 32
+
+                  email_re = re.compile(
+                      r"^\s*ACCOUNT_(\d+)_EMAIL\s*=",
+                      re.IGNORECASE,
+                  )
+
+                  proxy_re = re.compile(
+                      r"^\s*(?:(#)\s*)?"
+                      r"ACCOUNT_(\d+)_PROXY_(URL|PORT)\s*=(.*)$",
+                      re.IGNORECASE,
+                  )
+
+                  with open(ENV_FILE, "r", encoding="utf-8") as file:
+                      lines = file.read().splitlines()
+
+                  account_ids = sorted({
+                      int(match.group(1))
+                      for line in lines
+                      if (match := email_re.match(line))
+                  })
+
+                  proxy_entries = {
+                      account_id: {
+                          "active": {},
+                          "commented": {},
+                      }
+                      for account_id in account_ids
+                  }
+
+                  # 读取每个账号已有的代理配置。
+                  for line in lines:
+                      match = proxy_re.match(line)
+
+                      if not match:
+                          continue
+
+                      is_commented = bool(match.group(1))
+                      account_id = int(match.group(2))
+                      field = match.group(3).upper()
+                      value = match.group(4).strip()
+
+                      if account_id not in proxy_entries:
+                          continue
+
+                      if is_commented:
+                          proxy_entries[account_id]["commented"][field] = value
+                      else:
+                          proxy_entries[account_id]["active"][field] = value
+
+                  def classify(account_id):
+                      """
+                      existing：
+                          URL 和 PORT 均存在、未注释且有值，保留原代理。
+
+                      disabled：
+                          存在未注释代理行，但配置为空或不完整；
+                          或者存在被注释且有值的代理行。
+                          这两种情况都表示使用本机 IP。
+
+                      auto：
+                          没有代理配置；
+                          或者只有被注释且为空的代理配置。
+                      """
+                      entry = proxy_entries[account_id]
+                      active = entry["active"]
+                      commented = entry["commented"]
+
+                      if (
+                          active.get("URL", "") != ""
+                          and active.get("PORT", "") != ""
+                      ):
+                          return "existing"
+
+                      if active:
+                          return "disabled"
+
+                      if any(value != "" for value in commented.values()):
+                          return "disabled"
+
+                      return "auto"
+
+                  auto_account_ids = [
+                      account_id
+                      for account_id in account_ids
+                      if classify(account_id) == "auto"
+                  ]
+
+                  def write_empty(reason):
+                      print(
+                          f"::warning::{reason}；"
+                          "需要自动代理的账号将使用本机 IP。"
+                      )
+
+                      with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
+                          json.dump([], file, separators=(",", ":"))
+
+                  # 如果没有需要自动代理的账号，则不请求接口。
+                  if not auto_account_ids:
+                      print("没有需要自动配置代理的账号，跳过代理接口请求。")
+
+                      with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
+                          json.dump([], file, separators=(",", ":"))
+
+                      raise SystemExit(0)
+
+                  proxy_api = os.environ.get("PROXY_API", "").strip()
+
+                  if not proxy_api:
+                      write_empty("Secret proxy_api 未配置")
+                      raise SystemExit(0)
+
+                  # 请求代理接口。
+                  # 不打印 URL，避免 Secret 中的 akey 出现在日志中。
+                  try:
+                      request = urllib.request.Request(
+                          proxy_api,
+                          headers={
+                              "User-Agent": "GitHub-Actions-Proxy-Checker/1.0",
+                              "Accept": "application/json",
+                          },
+                      )
+
+                      with urllib.request.urlopen(
+                          request,
+                          timeout=30,
+                      ) as response:
+                          api_result = json.load(response)
+
+                  except Exception:
+                      write_empty("代理接口请求失败")
+                      raise SystemExit(0)
+
+                  code = str(api_result.get("code", ""))
+
+                  if code != "10001":
+                      write_empty(f"代理接口返回错误代码 {code}")
+                      raise SystemExit(0)
+
+                  raw_proxies = (
+                      api_result
+                      .get("data", {})
+                      .get("proxy_list", [])
+                      or []
+                  )
+
+                  supported_protocols = {
+                      "http",
+                      "https",
+                      "socks4",
+                      "socks4a",
+                      "socks5",
+                      "socks5h",
+                  }
+
+                  candidates = []
+                  seen = set()
+
+                  # 清理、校验代理数据。
+                  for proxy in raw_proxies:
+                      try:
+                          ip = str(proxy.get("ip", "")).strip()
+                          port = int(proxy.get("port"))
+                          protocol = str(
+                              proxy.get("protocol", "")
+                          ).strip().lower()
+
+                          ipaddress.ip_address(ip)
+
+                          if not 1 <= port <= 65535:
+                              continue
+
+                          if protocol not in supported_protocols:
+                              continue
+
+                          key = (protocol, ip, port)
+
+                          if key in seen:
+                              continue
+
+                          seen.add(key)
+
+                          candidates.append({
+                              "protocol": protocol,
+                              "ip": ip,
+                              "port": port,
+                          })
+
+                      except (TypeError, ValueError):
+                          continue
+
+                  if not candidates:
+                      write_empty("代理接口没有返回受支持的代理")
+                      raise SystemExit(0)
+
+                  print(
+                      f"接口返回 {len(raw_proxies)} 个代理，"
+                      f"其中 {len(candidates)} 个代理格式有效，"
+                      "开始并发测速。"
+                  )
+
+                  def test_proxy(proxy):
+                      ip = proxy["ip"]
+                      port = proxy["port"]
+                      protocol = proxy["protocol"]
+
+                      # IPv6 地址放进 URL 时需要方括号。
+                      host = f"[{ip}]" if ":" in ip else ip
+                      proxy_url = f"{protocol}://{host}:{port}"
+
+                      command = [
+                          "curl",
+                          "--location",
+                          "--fail",
+                          "--silent",
+                          "--show-error",
+                          "--output",
+                          "/dev/null",
+                          "--connect-timeout",
+                          str(TEST_TIMEOUT),
+                          "--max-time",
+                          str(TEST_TIMEOUT),
+                          "--proxy",
+                          proxy_url,
+                          "--write-out",
+                          "%{time_total}",
+                          BAIDU_URL,
+                      ]
+
+                      try:
+                          result = subprocess.run(
+                              command,
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              text=True,
+                              timeout=TEST_TIMEOUT + 2,
+                              check=False,
+                          )
+
+                          if result.returncode != 0:
+                              return None
+
+                          latency = float(result.stdout.strip())
+
+                          if latency <= 0 or latency > TEST_TIMEOUT:
+                              return None
+
+                          return {
+                              **proxy,
+                              "latency": round(latency, 6),
+                          }
+
+                      except (
+                          subprocess.TimeoutExpired,
+                          TypeError,
+                          ValueError,
+                      ):
+                          return None
+
+                  usable = []
+                  worker_count = min(MAX_WORKERS, len(candidates))
+
+                  with concurrent.futures.ThreadPoolExecutor(
+                      max_workers=worker_count
+                  ) as executor:
+                      futures = [
+                          executor.submit(test_proxy, proxy)
+                          for proxy in candidates
+                      ]
+
+                      for future in concurrent.futures.as_completed(futures):
+                          result = future.result()
+
+                          if result is not None:
+                              usable.append(result)
+
+                  # 按访问百度耗时从快到慢排序。
+                  usable.sort(key=lambda proxy: proxy["latency"])
+
+                  # latency 只用于当前 job 排序，不传递给后续 job。
+                  output = [
+                      {
+                          "protocol": proxy["protocol"],
+                          "ip": proxy["ip"],
+                          "port": proxy["port"],
+                      }
+                      for proxy in usable
+                  ]
+
+                  with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
+                      json.dump(
+                          output,
+                          file,
+                          ensure_ascii=False,
+                          separators=(",", ":"),
+                      )
+
+                  if output:
+                      print(
+                          f"代理测速完成：{len(output)}/{len(candidates)} "
+                          "个代理可用，已按速度从快到慢排序。"
+                      )
+                  else:
+                      print(
+                          "::warning::所有代理均未在 10 秒内成功访问百度；"
+                          "需要自动代理的账号将使用本机 IP。"
+                      )
+                  PY
+
+                  PROXIES_JSON=$(cat .proxies.json)
+
                   echo "shards=${SHARDS_JSON}" >> "$GITHUB_OUTPUT"
                   echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+                  echo "proxies=${PROXIES_JSON}" >> "$GITHUB_OUTPUT"
 
     run:
         name: 运行 rewards（分片 ${{ matrix.chunk.display }}）
@@ -71,24 +419,21 @@ jobs:
         runs-on: ubuntu-latest
 
         strategy:
-            # 某个分片失败不影响其他分片继续执行。
             fail-fast: false
+
             matrix:
                 chunk: ${{ fromJSON(needs.prepare.outputs.shards) }}
 
         env:
-            # 实际运行的源仓库（不是存储本工作流的仓库）。
             SOURCE_REPO: zhangMonday/Microsoft-Rewards-Script
             SOURCE_REF: v4
 
         steps:
-            # 1. 检出源仓库，而非当前仓库。
             - name: 检出源仓库
               uses: actions/checkout@v7
               with:
                   repository: ${{ env.SOURCE_REPO }}
                   ref: ${{ env.SOURCE_REF }}
-                  # 用于源仓库的 PAT，需具有 'repo' 范围（经典）或细粒度 Contents: Read 权限。
                   token: ${{ secrets.SOURCE_REPO_TOKEN }}
                   persist-credentials: false
 
@@ -103,10 +448,12 @@ jobs:
                   [ -f /etc/apt/sources.list ] && sudo sed -i 's/security.ubuntu.com/azure.archive.ubuntu.com/g' /etc/apt/sources.list || true
                   [ -f /etc/apt/sources.list.d/ubuntu.sources ] && sudo sed -i 's/archive.ubuntu.com/azure.archive.ubuntu.com/g' /etc/apt/sources.list.d/ubuntu.sources || true
                   [ -f /etc/apt/sources.list.d/ubuntu.sources ] && sudo sed -i 's/security.ubuntu.com/azure.archive.ubuntu.com/g' /etc/apt/sources.list.d/ubuntu.sources || true
+
                   echo 'Acquire::http::Timeout "30";' | sudo tee /etc/apt/apt.conf.d/99custom > /dev/null
                   echo 'Acquire::ftp::Timeout "30";' | sudo tee -a /etc/apt/apt.conf.d/99custom > /dev/null
                   echo 'Acquire::Retries "5";' | sudo tee -a /etc/apt/apt.conf.d/99custom > /dev/null
                   echo 'Acquire::ForceIPv4 "true";' | sudo tee -a /etc/apt/apt.conf.d/99custom > /dev/null
+
                   sudo apt-get update
                   sudo apt-get install -y fonts-wqy-zenhei
 
@@ -118,20 +465,17 @@ jobs:
             - name: 启动虚拟显示器
               run: |
                   Xvfb :99 -screen 0 1024x768x24 &
-                  echo "DISPLAY=:99" >> $GITHUB_ENV
+                  echo "DISPLAY=:99" >> "$GITHUB_ENV"
 
-            # 2. Node.js 24（脚本的 package.json engines 字段要求）。
             - name: 设置 Node.js
               uses: actions/setup-node@v7
               with:
                   node-version: 24
                   cache: npm
 
-            # 3. 安装依赖（跳过生命周期脚本；浏览器将单独安装）。
             - name: 安装依赖
               run: npm ci --ignore-scripts
 
-            # 4. 在运行间缓存 Patchright/Chromium 浏览器下载。
             - name: 缓存 Patchright 浏览器
               id: browser-cache
               uses: actions/cache@v6
@@ -144,9 +488,6 @@ jobs:
             - name: 安装 Chromium（含系统依赖）
               run: npx patchright install --with-deps chromium
 
-            # 5. 从上次运行恢复登录会话，避免重复 2FA/登录。
-            #    缓存以运行编号 + 分片号为键，每个分片（job）独立读写自己的会话缓存，
-            #    避免并行分片之间互相覆盖；并兼容恢复旧的未分片缓存。
             - name: 恢复会话
               id: sessions-cache
               uses: actions/cache@v6
@@ -157,50 +498,350 @@ jobs:
                       msr-sessions-shard-${{ matrix.chunk.shard }}-
                       msr-sessions-
 
-            # 6. 将账户凭据从 ACCOUNTS_ENV secret 写入 .env.full（完整账号列表）。
-            #    ACCOUNTS_ENV 包含完整的 .env 文件内容（ACCOUNT_1_EMAIL=... 等）。
             - name: 写入 .env.full
               env:
                   ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
               run: |
-                  if [ -z "$ACCOUNTS_ENV" ]; then
-                    echo "::error::Secret ACCOUNTS_ENV 为空。请添加 ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD（等）到其中。"
+                  set -euo pipefail
+
+                  if [ -z "${ACCOUNTS_ENV:-}" ]; then
+                    echo "::error::Secret ACCOUNTS_ENV 为空。"
                     exit 1
                   fi
-                  printf '%s\n' "$ACCOUNTS_ENV" > .env.full
-                  echo "已写入 .env.full，共 $(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true) 个账户邮箱行。"
 
-            # 6b. 按分片拆分账号配置：每个 job 只保留属于自己的账号（按邮箱行排序后每 5 个一片），
-            #     并重排为 ACCOUNT_1..N，非账号行（如 API_TOKEN 等其他配置）原样保留。
-            #     单分片（<=5 个账号）时不做拆分，与原有单 job 逻辑完全一致。
-            - name: 按分片生成 .env
+                  printf '%s\n' "$ACCOUNTS_ENV" > .env.full
+
+                  echo "已写入 .env.full，共 $(grep -cE '^[[:space:]]*ACCOUNT_[0-9]+_EMAIL=' .env.full || true) 个账户邮箱行。"
+
+            - name: 按分片和代理规则生成 .env
               env:
                   SHARD: ${{ matrix.chunk.shard }}
+                  PROXIES_JSON: ${{ needs.prepare.outputs.proxies }}
               run: |
                   set -euo pipefail
-                  TOTAL=$(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
-                  SHARDS=$(( (TOTAL + 4) / 5 ))
-                  if [ "$SHARDS" -le 1 ]; then
-                    cp .env.full .env
-                    echo "账号数 ${TOTAL} <= 5，单 job 运行，.env 不做拆分。"
-                  else
-                    mapfile -t ACCTS < <(grep -oE '^ACCOUNT_[0-9]+_EMAIL=' .env.full | sed -E 's/^ACCOUNT_([0-9]+)_EMAIL=/\1/' | sort -nu)
-                    START=$((SHARD * 5))
-                    grep -vE '^ACCOUNT_[0-9]+_' .env.full > .env || true
-                    NEW=1
-                    for OLD in "${ACCTS[@]:$START:5}"; do
-                      grep -E "^ACCOUNT_${OLD}_" .env.full | sed -E "s/^ACCOUNT_${OLD}_/ACCOUNT_${NEW}_/" >> .env
-                      echo "  原账号槽位 ${OLD} -> 本 job 槽位 ${NEW}"
-                      NEW=$((NEW + 1))
-                    done
-                    echo "分片 $((SHARD + 1))/${SHARDS}：总账号 ${TOTAL} 个，本 job 负责 $((NEW - 1)) 个。"
-                  fi
 
-            # 7. 构建 config.json。
-            #    - 如果设置了 CONFIG_JSON variable/secret，则原样使用（支持所有配置选项）。
-            #    - 否则使用仓库的 config.example.json 作为基础。
-            #    然后强制设置 CI 中必须不同的参数（headless、diagnostics），
-            #    并应用可选的 workflow_dispatch 覆盖参数。
+                  python3 <<'PY'
+                  import json
+                  import math
+                  import os
+                  import re
+
+                  INPUT_FILE = ".env.full"
+                  OUTPUT_FILE = ".env"
+
+                  ACCOUNTS_PER_SHARD = 5
+
+                  shard = int(os.environ["SHARD"])
+                  proxies_json = os.environ.get("PROXIES_JSON", "[]").strip()
+
+                  try:
+                      proxies = json.loads(proxies_json or "[]")
+
+                      if not isinstance(proxies, list):
+                          raise ValueError("代理结果不是数组")
+
+                  except (json.JSONDecodeError, ValueError):
+                      print(
+                          "::warning::代理结果格式无效，"
+                          "自动代理账号将使用本机 IP。"
+                      )
+                      proxies = []
+
+                  with open(INPUT_FILE, "r", encoding="utf-8") as file:
+                      lines = file.read().splitlines()
+
+                  email_re = re.compile(
+                      r"^\s*ACCOUNT_(\d+)_EMAIL\s*=",
+                      re.IGNORECASE,
+                  )
+
+                  # 匹配账号配置行，包括被注释的账号配置行。
+                  account_line_re = re.compile(
+                      r"^(\s*(?:#\s*)?)"
+                      r"ACCOUNT_(\d+)_([A-Za-z0-9_]+)"
+                      r"(\s*=.*)$",
+                      re.IGNORECASE,
+                  )
+
+                  proxy_line_re = re.compile(
+                      r"^\s*(?:(#)\s*)?"
+                      r"ACCOUNT_(\d+)_PROXY_(URL|PORT)\s*=(.*)$",
+                      re.IGNORECASE,
+                  )
+
+                  account_ids = sorted({
+                      int(match.group(1))
+                      for line in lines
+                      if (match := email_re.match(line))
+                  })
+
+                  if not account_ids:
+                      raise SystemExit(
+                          "ACCOUNTS_ENV 中没有找到有效的 ACCOUNT_N_EMAIL"
+                      )
+
+                  proxy_entries = {
+                      account_id: {
+                          "active": {},
+                          "commented": {},
+                      }
+                      for account_id in account_ids
+                  }
+
+                  for line in lines:
+                      match = proxy_line_re.match(line)
+
+                      if not match:
+                          continue
+
+                      is_commented = bool(match.group(1))
+                      account_id = int(match.group(2))
+                      field = match.group(3).upper()
+                      value = match.group(4).strip()
+
+                      if account_id not in proxy_entries:
+                          continue
+
+                      target = (
+                          proxy_entries[account_id]["commented"]
+                          if is_commented
+                          else proxy_entries[account_id]["active"]
+                      )
+
+                      target[field] = value
+
+                  def classify(account_id):
+                      entry = proxy_entries[account_id]
+                      active = entry["active"]
+                      commented = entry["commented"]
+
+                      # 完整的未注释代理配置：保留。
+                      if (
+                          active.get("URL", "") != ""
+                          and active.get("PORT", "") != ""
+                      ):
+                          return "existing"
+
+                      # 未注释但为空或不完整：使用本机 IP。
+                      if active:
+                          return "disabled"
+
+                      # 被注释且有值：使用本机 IP。
+                      if any(value != "" for value in commented.values()):
+                          return "disabled"
+
+                      # 没有配置，或被注释且为空：自动代理。
+                      return "auto"
+
+                  statuses = {
+                      account_id: classify(account_id)
+                      for account_id in account_ids
+                  }
+
+                  auto_account_ids = [
+                      account_id
+                      for account_id in account_ids
+                      if statuses[account_id] == "auto"
+                  ]
+
+                  automatic_assignments = {}
+
+                  auto_count = len(auto_account_ids)
+                  proxy_count = len(proxies)
+
+                  if auto_count > 0 and proxy_count > 0:
+                      # 每 5 个账号使用一个代理时所需的代理数量。
+                      required_proxy_count = math.ceil(
+                          auto_count / ACCOUNTS_PER_SHARD
+                      )
+
+                      if proxy_count >= required_proxy_count:
+                          # 代理数量充足：
+                          # 只使用速度最快的 ceil(账号数 / 5) 个代理。
+                          used_proxy_count = required_proxy_count
+
+                          for position, account_id in enumerate(
+                              auto_account_ids
+                          ):
+                              proxy_index = (
+                                  position // ACCOUNTS_PER_SHARD
+                              )
+
+                              automatic_assignments[account_id] = (
+                                  proxies[proxy_index]
+                              )
+
+                      else:
+                          # 代理数量不足：
+                          # 将全部可用代理尽量平均分配给需要代理的账号。
+                          used_proxy_count = proxy_count
+
+                          for position, account_id in enumerate(
+                              auto_account_ids
+                          ):
+                              proxy_index = (
+                                  position * used_proxy_count
+                              ) // auto_count
+
+                              proxy_index = min(
+                                  proxy_index,
+                                  used_proxy_count - 1,
+                              )
+
+                              automatic_assignments[account_id] = (
+                                  proxies[proxy_index]
+                              )
+
+                      print(
+                          f"需要自动代理的账号：{auto_count} 个；"
+                          f"可用代理：{proxy_count} 个；"
+                          f"实际使用代理：{used_proxy_count} 个。"
+                      )
+
+                  elif auto_count > 0:
+                      print(
+                          f"需要自动代理的账号：{auto_count} 个；"
+                          "没有可用代理，这些账号将使用本机 IP。"
+                      )
+
+                  else:
+                      print("没有需要自动配置代理的账号。")
+
+                  start = shard * ACCOUNTS_PER_SHARD
+                  selected_ids = account_ids[
+                      start:start + ACCOUNTS_PER_SHARD
+                  ]
+
+                  if not selected_ids:
+                      raise SystemExit(
+                          f"分片 {shard} 没有可运行的账号"
+                      )
+
+                  # 保留全局配置，例如 API_TOKEN 等。
+                  output_lines = []
+
+                  for line in lines:
+                      match = account_line_re.match(line)
+
+                      if match:
+                          # 所有账号行稍后重新生成。
+                          continue
+
+                      output_lines.append(line)
+
+                  if output_lines and output_lines[-1] != "":
+                      output_lines.append("")
+
+                  # 将当前分片账号重排为 ACCOUNT_1、ACCOUNT_2……
+                  for new_id, old_id in enumerate(selected_ids, start=1):
+                      for line in lines:
+                          match = account_line_re.match(line)
+
+                          if not match:
+                              continue
+
+                          line_account_id = int(match.group(2))
+                          field = match.group(3)
+
+                          if line_account_id != old_id:
+                              continue
+
+                          # 原代理行统一删除，之后根据规则重新写入。
+                          if field.upper() in {
+                              "PROXY_URL",
+                              "PROXY_PORT",
+                          }:
+                              continue
+
+                          prefix = match.group(1)
+                          suffix = match.group(4)
+
+                          output_lines.append(
+                              f"{prefix}ACCOUNT_{new_id}_{field}{suffix}"
+                          )
+
+                      status = statuses[old_id]
+
+                      if status == "existing":
+                          # 保留用户已经配置好的代理。
+                          active = proxy_entries[old_id]["active"]
+
+                          output_lines.append(
+                              f"ACCOUNT_{new_id}_PROXY_URL="
+                              f"{active['URL']}"
+                          )
+
+                          output_lines.append(
+                              f"ACCOUNT_{new_id}_PROXY_PORT="
+                              f"{active['PORT']}"
+                          )
+
+                          action = "保留用户代理"
+
+                      elif (
+                          status == "auto"
+                          and old_id in automatic_assignments
+                      ):
+                          # 写入自动分配的代理。
+                          proxy = automatic_assignments[old_id]
+
+                          protocol = str(
+                              proxy["protocol"]
+                          ).strip().lower()
+
+                          ip = str(proxy["ip"]).strip()
+                          port = int(proxy["port"])
+
+                          # IPv6 地址在代理 URL 中需要方括号。
+                          host = f"[{ip}]" if ":" in ip else ip
+
+                          output_lines.append(
+                              f"ACCOUNT_{new_id}_PROXY_URL="
+                              f"{protocol}://{host}"
+                          )
+
+                          output_lines.append(
+                              f"ACCOUNT_{new_id}_PROXY_PORT={port}"
+                          )
+
+                          action = "使用自动代理"
+
+                      elif status == "disabled":
+                          # 用户明确禁用代理，不写代理配置行。
+                          action = "按用户配置使用本机 IP"
+
+                      else:
+                          # 没有可用代理，不写代理配置行。
+                          action = "无可用代理，使用本机 IP"
+
+                      output_lines.append("")
+
+                      print(
+                          f"原账号槽位 {old_id} -> "
+                          f"本 job 槽位 {new_id}：{action}"
+                      )
+
+                  while output_lines and output_lines[-1] == "":
+                      output_lines.pop()
+
+                  with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
+                      file.write("\n".join(output_lines) + "\n")
+
+                  total_shards = math.ceil(
+                      len(account_ids) / ACCOUNTS_PER_SHARD
+                  )
+
+                  print(
+                      f"分片 {shard + 1}/{total_shards}："
+                      f"总账号 {len(account_ids)} 个，"
+                      f"本 job 负责 {len(selected_ids)} 个。"
+                  )
+                  PY
+
+                  echo "当前分片 .env 已生成。"
+                  echo "当前分片账号数：$(grep -cE '^[[:space:]]*ACCOUNT_[0-9]+_EMAIL=' .env || true)"
+                  echo "当前分片代理数：$(grep -cE '^[[:space:]]*ACCOUNT_[0-9]+_PROXY_URL=.+$' .env || true)"
+
             - name: 构建 config.json
               env:
                   CONFIG_JSON: ${{ vars.CONFIG_JSON != '' && vars.CONFIG_JSON || secrets.CONFIG_JSON }}
@@ -208,6 +849,7 @@ jobs:
                   INPUT_RUN_ON_ZERO_POINTS: ${{ inputs.run_on_zero_points }}
               run: |
                   set -euo pipefail
+
                   if [ -n "${CONFIG_JSON:-}" ]; then
                     printf '%s' "$CONFIG_JSON" > config.json
                     echo "使用来自仓库 variable/secret 的 CONFIG_JSON。"
@@ -216,28 +858,29 @@ jobs:
                     echo "未设置 CONFIG_JSON；使用 config.example.json 作为基础。"
                   fi
 
-                  # 提前验证 JSON 格式。
                   jq empty config.json
 
-                  # 保留 config.json 中的 headless 设置；Xvfb 仅提供可选的虚拟显示环境。
                   tmp=$(mktemp)
-                  jq '.errorDiagnostics = true' config.json > "$tmp" && mv "$tmp" config.json
+
+                  jq '.errorDiagnostics = true' config.json > "$tmp"
+                  mv "$tmp" config.json
 
                   if [ "${INPUT_DEBUG_LOGS}" = "true" ]; then
-                    jq '.debugLogs = true' config.json > "$tmp" && mv "$tmp" config.json
-                  fi
-                  if [ "${INPUT_RUN_ON_ZERO_POINTS}" = "true" ]; then
-                    jq '.searchSettings.runOnZeroPoints = true' config.json > "$tmp" && mv "$tmp" config.json
+                    jq '.debugLogs = true' config.json > "$tmp"
+                    mv "$tmp" config.json
                   fi
 
-            # 8. 构建并运行。
+                  if [ "${INPUT_RUN_ON_ZERO_POINTS}" = "true" ]; then
+                    jq '.searchSettings.runOnZeroPoints = true' config.json > "$tmp"
+                    mv "$tmp" config.json
+                  fi
+
             - name: 构建
               run: npm run build
 
             - name: 运行 Microsoft Rewards 脚本
               run: npm start
 
-            # 9. 持久化更新后的会话以供下次运行使用。
             - name: 保存会话
               if: always()
               uses: actions/cache/save@v6
@@ -245,7 +888,6 @@ jobs:
                   path: sessions
                   key: msr-sessions-shard-${{ matrix.chunk.shard }}-${{ github.run_id }}
 
-            # 10. 上传诊断/日志文件用于故障排查（保留 7 天）。
             - name: 上传诊断信息
               if: always()
               uses: actions/upload-artifact@v6

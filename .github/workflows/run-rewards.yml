@@ -1,17 +1,11 @@
 name: 运行 Microsoft Rewards
 
-# 本工作流按计划（以及按需）运行 Microsoft Rewards 脚本。
-# 它不运行存储本工作流文件的仓库代码，
-# 而是检出 zhangMonday/Microsoft-Rewards-Script@v4 并运行。
-#
-# 所需的 secrets/variables 详见 .github/workflows/README.md。
-#
-# 需要配置的 Secrets：
+# 所需 Secrets：
 #   ACCOUNTS_ENV
 #   SOURCE_REPO_TOKEN
 #   proxy_api
 #
-# proxy_api 的值应为完整的代理 API 地址。
+# proxy_api 中保存完整的代理接口 URL，不要写入本 yaml。
 
 on:
     workflow_dispatch:
@@ -39,12 +33,13 @@ permissions:
 
 jobs:
     # 前置 job：
-    # 1. 统计账号数量并生成分片矩阵；
-    # 2. 获取代理；
-    # 3. 多线程测试代理；
-    # 4. 将代理结果传递给各个运行 job。
+    # 1. 统计账号并生成分片矩阵；
+    # 2. 判断哪些账号需要自动代理；
+    # 3. 从 proxy_api 获取代理；
+    # 4. 并发测试所有代理访问百度；
+    # 5. 将测速后的代理结果传给各分片 job。
     prepare:
-        name: 计算账号分片和代理
+        name: 计算账号分片和测试代理
         runs-on: ubuntu-latest
 
         outputs:
@@ -53,7 +48,7 @@ jobs:
             proxies: ${{ steps.split.outputs.proxies }}
 
         steps:
-            - name: 统计账号、测试代理并生成分片矩阵
+            - name: 统计账号、获取并测试代理
               id: split
               env:
                   ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
@@ -75,10 +70,11 @@ jobs:
                     exit 1
                   fi
 
+                  # 每 5 个账号一个 job。
                   SHARDS=$(( (TOTAL + 4) / 5 ))
 
                   echo "账号总数: ${TOTAL}"
-                  echo "分片（job）数: ${SHARDS}"
+                  echo "分片 job 数: ${SHARDS}"
 
                   SHARDS_JSON=$(jq -cn \
                     --argjson n "$SHARDS" \
@@ -86,7 +82,6 @@ jobs:
 
                   python3 <<'PY'
                   import concurrent.futures
-                  import ipaddress
                   import json
                   import os
                   import re
@@ -96,9 +91,16 @@ jobs:
                   ENV_FILE = ".env.full"
                   OUTPUT_FILE = ".proxies.json"
 
-                  BAIDU_URL = "https://www.baidu.com/"
-                  TEST_TIMEOUT = 10
-                  MAX_WORKERS = 32
+                  # 使用 HTTP 而非 HTTPS 测速。
+                  # 部分免费 SOCKS4/HTTP 代理无法稳定处理 HTTPS，
+                  # 但仍然可以正常访问百度 HTTP 页面。
+                  BAIDU_URL = "http://www.baidu.com/"
+
+                  # 要求：20 秒内收到百度任意 HTTP 响应即视为可用。
+                  TEST_TIMEOUT = 20
+
+                  # 同时测试的代理数量。
+                  MAX_WORKERS = 50
 
                   email_re = re.compile(
                       r"^\s*ACCOUNT_(\d+)_EMAIL\s*=",
@@ -110,6 +112,15 @@ jobs:
                       r"ACCOUNT_(\d+)_PROXY_(URL|PORT)\s*=(.*)$",
                       re.IGNORECASE,
                   )
+
+                  def clean_log_text(value, limit=300):
+                      """
+                      防止接口返回内容中带有换行或 GitHub Actions 命令格式。
+                      """
+                      text = str(value or "")
+                      text = text.replace("\r", " ").replace("\n", " ")
+                      text = text.replace("::", "：")
+                      return text[:limit]
 
                   with open(ENV_FILE, "r", encoding="utf-8") as file:
                       lines = file.read().splitlines()
@@ -128,7 +139,7 @@ jobs:
                       for account_id in account_ids
                   }
 
-                  # 读取每个账号已有的代理配置。
+                  # 读取账号中已有的代理设置，用于判断是否需要请求代理接口。
                   for line in lines:
                       match = proxy_re.match(line)
 
@@ -151,16 +162,17 @@ jobs:
                   def classify(account_id):
                       """
                       existing：
-                          URL 和 PORT 均存在、未注释且有值，保留原代理。
+                        URL、PORT 都未注释且有值，保留用户已有代理。
 
                       disabled：
-                          存在未注释代理行，但配置为空或不完整；
-                          或者存在被注释且有值的代理行。
-                          这两种情况都表示使用本机 IP。
+                        代理行未注释但为空/不完整；
+                        或代理行被注释但其中存在值。
+                        这些均表示用户明确要求不用代理。
 
                       auto：
-                          没有代理配置；
-                          或者只有被注释且为空的代理配置。
+                        没有代理行；
+                        或代理行被注释且全部为空。
+                        这些账号将自动获取代理。
                       """
                       entry = proxy_entries[account_id]
                       active = entry["active"]
@@ -186,16 +198,23 @@ jobs:
                       if classify(account_id) == "auto"
                   ]
 
+                  print(
+                      f"账号代理状态："
+                      f"已有代理 {sum(classify(i) == 'existing' for i in account_ids)} 个，"
+                      f"明确不用代理 {sum(classify(i) == 'disabled' for i in account_ids)} 个，"
+                      f"需要自动代理 {len(auto_account_ids)} 个。"
+                  )
+
                   def write_empty(reason):
                       print(
                           f"::warning::{reason}；"
-                          "需要自动代理的账号将使用本机 IP。"
+                          "需要自动代理的账号将使用 GitHub Actions Runner 本机 IP。"
                       )
 
                       with open(OUTPUT_FILE, "w", encoding="utf-8") as file:
                           json.dump([], file, separators=(",", ":"))
 
-                  # 如果没有需要自动代理的账号，则不请求接口。
+                  # 没有自动代理需求时，不调用接口。
                   if not auto_account_ids:
                       print("没有需要自动配置代理的账号，跳过代理接口请求。")
 
@@ -210,8 +229,7 @@ jobs:
                       write_empty("Secret proxy_api 未配置")
                       raise SystemExit(0)
 
-                  # 请求代理接口。
-                  # 不打印 URL，避免 Secret 中的 akey 出现在日志中。
+                  # 不打印请求地址，防止 proxy_api Secret 泄露到日志。
                   try:
                       request = urllib.request.Request(
                           proxy_api,
@@ -231,10 +249,13 @@ jobs:
                       write_empty("代理接口请求失败")
                       raise SystemExit(0)
 
-                  code = str(api_result.get("code", ""))
+                  api_code = str(api_result.get("code", ""))
 
-                  if code != "10001":
-                      write_empty(f"代理接口返回错误代码 {code}")
+                  if api_code != "10001":
+                      api_msg = clean_log_text(api_result.get("msg", ""))
+                      write_empty(
+                          f"代理接口返回错误代码 {api_code}，信息：{api_msg}"
+                      )
                       raise SystemExit(0)
 
                   raw_proxies = (
@@ -244,6 +265,12 @@ jobs:
                       or []
                   )
 
+                  # 不再进行严格 IP 地址格式验证。
+                  # 只要求协议、IP/主机字段和端口存在即可；
+                  # 真实可用性完全由后续 curl 访问百度测试决定。
+                  #
+                  # socks4 / socks4a / socks5 / socks5h：
+                  # GitHub Runner 自带 curl 均支持。
                   supported_protocols = {
                       "http",
                       "https",
@@ -255,23 +282,46 @@ jobs:
 
                   candidates = []
                   seen = set()
+                  rejected_count = 0
 
-                  # 清理、校验代理数据。
                   for proxy in raw_proxies:
                       try:
                           ip = str(proxy.get("ip", "")).strip()
-                          port = int(proxy.get("port"))
+                          port_raw = proxy.get("port")
+                          port = int(port_raw)
+
                           protocol = str(
                               proxy.get("protocol", "")
                           ).strip().lower()
 
-                          ipaddress.ip_address(ip)
+                          adr = clean_log_text(proxy.get("adr", "未知地区"))
+                          level = clean_log_text(proxy.get("level", "未知"))
 
-                          if not 1 <= port <= 65535:
+                          # 协议字段为空时按 HTTP 尝试，
+                          # 避免因接口偶发缺少 protocol 而过早过滤代理。
+                          if not protocol:
+                              protocol = "http"
+
+                          if not ip or not (1 <= port <= 65535):
+                              rejected_count += 1
+                              print(
+                                  "代理格式无效，跳过："
+                                  f"ip={clean_log_text(ip)} "
+                                  f"port={clean_log_text(port_raw)} "
+                                  f"protocol={clean_log_text(protocol)} "
+                                  f"adr={adr}"
+                              )
                               continue
 
+                          # 接口若给出了未知协议，仍按 HTTP 尝试。
+                          # 这样比直接丢弃更宽松。
                           if protocol not in supported_protocols:
-                              continue
+                              print(
+                                  f"代理协议 {protocol} 不在常见列表中，"
+                                  f"将按 http 协议测速："
+                                  f"{ip}:{port}，adr={adr}"
+                              )
+                              protocol = "http"
 
                           key = (protocol, ip, port)
 
@@ -284,19 +334,32 @@ jobs:
                               "protocol": protocol,
                               "ip": ip,
                               "port": port,
+                              "adr": adr,
+                              "level": level,
                           })
 
                       except (TypeError, ValueError):
-                          continue
-
-                  if not candidates:
-                      write_empty("代理接口没有返回受支持的代理")
-                      raise SystemExit(0)
+                          rejected_count += 1
+                          print(
+                              "代理字段无法解析，跳过："
+                              f"{clean_log_text(proxy)}"
+                          )
 
                   print(
-                      f"接口返回 {len(raw_proxies)} 个代理，"
-                      f"其中 {len(candidates)} 个代理格式有效，"
-                      "开始并发测速。"
+                      f"代理接口返回 {len(raw_proxies)} 条记录；"
+                      f"允许测速 {len(candidates)} 条；"
+                      f"格式无效跳过 {rejected_count} 条。"
+                  )
+
+                  if not candidates:
+                      write_empty("代理接口没有可测试的代理")
+                      raise SystemExit(0)
+
+                  print("========== 开始并发测试代理 ==========")
+                  print(
+                      f"测试地址：{BAIDU_URL}；"
+                      f"单个代理最长：{TEST_TIMEOUT} 秒；"
+                      f"并发数：{min(MAX_WORKERS, len(candidates))}"
                   )
 
                   def test_proxy(proxy):
@@ -304,14 +367,20 @@ jobs:
                       port = proxy["port"]
                       protocol = proxy["protocol"]
 
-                      # IPv6 地址放进 URL 时需要方括号。
-                      host = f"[{ip}]" if ":" in ip else ip
+                      # IPv6 形式地址在 URL 中须加方括号；
+                      # 普通 IPv4 或主机名直接使用。
+                      host = f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
                       proxy_url = f"{protocol}://{host}:{port}"
 
+                      # 不使用 --fail：
+                      # 只要代理能在 20 秒内成功返回任意 HTTP 状态码，
+                      # 即说明网络通路有效。
+                      #
+                      # 例如 301、302、403、404 也会被记录为可连通，
+                      # 避免免费代理因百度重定向、地区限制或反爬页面被误判失效。
                       command = [
                           "curl",
                           "--location",
-                          "--fail",
                           "--silent",
                           "--show-error",
                           "--output",
@@ -323,7 +392,7 @@ jobs:
                           "--proxy",
                           proxy_url,
                           "--write-out",
-                          "%{time_total}",
+                          "%{http_code}|%{time_total}|%{remote_ip}",
                           BAIDU_URL,
                       ]
 
@@ -333,31 +402,74 @@ jobs:
                               stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE,
                               text=True,
-                              timeout=TEST_TIMEOUT + 2,
+                              timeout=TEST_TIMEOUT + 3,
                               check=False,
                           )
 
-                          if result.returncode != 0:
-                              return None
+                          output = result.stdout.strip()
+                          error = clean_log_text(result.stderr.strip())
 
-                          latency = float(result.stdout.strip())
+                          http_code = 0
+                          latency = None
+                          remote_ip = ""
 
-                          if latency <= 0 or latency > TEST_TIMEOUT:
-                              return None
+                          try:
+                              parts = output.split("|")
+                              http_code = int(parts[0])
+                              latency = float(parts[1])
+                              remote_ip = clean_log_text(parts[2]) if len(parts) > 2 else ""
+                          except (
+                              IndexError,
+                              TypeError,
+                              ValueError,
+                          ):
+                              pass
+
+                          # 只要收到有效 HTTP 状态码，且总时间未超过 20 秒，
+                          # 即认定该代理可用。
+                          #
+                          # http_code=000 表示未收到 HTTP 响应，例如连接失败、
+                          # TLS 失败、代理握手失败、超时等。
+                          valid = (
+                              result.returncode == 0
+                              and 100 <= http_code <= 599
+                              and latency is not None
+                              and 0 < latency <= TEST_TIMEOUT
+                          )
 
                           return {
                               **proxy,
-                              "latency": round(latency, 6),
+                              "valid": valid,
+                              "http_code": http_code,
+                              "latency": latency,
+                              "remote_ip": remote_ip,
+                              "curl_exit_code": result.returncode,
+                              "error": error,
                           }
 
-                      except (
-                          subprocess.TimeoutExpired,
-                          TypeError,
-                          ValueError,
-                      ):
-                          return None
+                      except subprocess.TimeoutExpired:
+                          return {
+                              **proxy,
+                              "valid": False,
+                              "http_code": 0,
+                              "latency": None,
+                              "remote_ip": "",
+                              "curl_exit_code": -1,
+                              "error": f"curl 进程超过 {TEST_TIMEOUT + 3} 秒仍未结束",
+                          }
 
-                  usable = []
+                      except Exception as error:
+                          return {
+                              **proxy,
+                              "valid": False,
+                              "http_code": 0,
+                              "latency": None,
+                              "remote_ip": "",
+                              "curl_exit_code": -2,
+                              "error": clean_log_text(error),
+                          }
+
+                  results = []
                   worker_count = min(MAX_WORKERS, len(candidates))
 
                   with concurrent.futures.ThreadPoolExecutor(
@@ -370,19 +482,84 @@ jobs:
 
                       for future in concurrent.futures.as_completed(futures):
                           result = future.result()
+                          results.append(result)
 
-                          if result is not None:
-                              usable.append(result)
+                          address = (
+                              f"{result['protocol']}://"
+                              f"{result['ip']}:{result['port']}"
+                          )
 
-                  # 按访问百度耗时从快到慢排序。
+                          if result["valid"]:
+                              print(
+                                  "✅ 有效代理 | "
+                                  f"代理={address} | "
+                                  f"地区={result['adr']} | "
+                                  f"匿名度={result['level']} | "
+                                  f"HTTP={result['http_code']} | "
+                                  f"耗时={result['latency']:.3f}s | "
+                                  f"百度远端IP={result['remote_ip'] or '未知'}"
+                              )
+                          else:
+                              latency_text = (
+                                  f"{result['latency']:.3f}s"
+                                  if result["latency"] is not None
+                                  else "无"
+                              )
+
+                              error_text = result["error"] or "未收到有效 HTTP 响应"
+
+                              print(
+                                  "❌ 无效代理 | "
+                                  f"代理={address} | "
+                                  f"地区={result['adr']} | "
+                                  f"匿名度={result['level']} | "
+                                  f"HTTP={result['http_code']} | "
+                                  f"耗时={latency_text} | "
+                                  f"curl退出码={result['curl_exit_code']} | "
+                                  f"原因={error_text}"
+                              )
+
+                  usable = [
+                      result
+                      for result in results
+                      if result["valid"]
+                  ]
+
+                  # 可用代理从快到慢排序。
                   usable.sort(key=lambda proxy: proxy["latency"])
 
-                  # latency 只用于当前 job 排序，不传递给后续 job。
+                  print("========== 代理测速汇总 ==========")
+                  print(
+                      f"总测试数：{len(results)}；"
+                      f"有效：{len(usable)}；"
+                      f"无效：{len(results) - len(usable)}。"
+                  )
+
+                  if usable:
+                      print("按速度排序后的有效代理：")
+
+                      for index, proxy in enumerate(usable, start=1):
+                          print(
+                              f"  #{index} | "
+                              f"{proxy['protocol']}://{proxy['ip']}:{proxy['port']} | "
+                              f"地区={proxy['adr']} | "
+                              f"匿名度={proxy['level']} | "
+                              f"HTTP={proxy['http_code']} | "
+                              f"耗时={proxy['latency']:.3f}s"
+                          )
+                  else:
+                      print(
+                          "::warning::全部代理未能在 20 秒内收到百度 HTTP 响应。"
+                      )
+
+                  # 后续 job 仅需要协议、地址和端口。
                   output = [
                       {
                           "protocol": proxy["protocol"],
                           "ip": proxy["ip"],
                           "port": proxy["port"],
+                          "adr": proxy["adr"],
+                          "latency": proxy["latency"],
                       }
                       for proxy in usable
                   ]
@@ -393,17 +570,6 @@ jobs:
                           file,
                           ensure_ascii=False,
                           separators=(",", ":"),
-                      )
-
-                  if output:
-                      print(
-                          f"代理测速完成：{len(output)}/{len(candidates)} "
-                          "个代理可用，已按速度从快到慢排序。"
-                      )
-                  else:
-                      print(
-                          "::warning::所有代理均未在 10 秒内成功访问百度；"
-                          "需要自动代理的账号将使用本机 IP。"
                       )
                   PY
 
@@ -419,12 +585,13 @@ jobs:
         runs-on: ubuntu-latest
 
         strategy:
+            # 某个分片失败不影响其他分片继续执行。
             fail-fast: false
-
             matrix:
                 chunk: ${{ fromJSON(needs.prepare.outputs.shards) }}
 
         env:
+            # 实际运行的源仓库。
             SOURCE_REPO: zhangMonday/Microsoft-Rewards-Script
             SOURCE_REF: v4
 
@@ -457,7 +624,7 @@ jobs:
                   sudo apt-get update
                   sudo apt-get install -y fonts-wqy-zenhei
 
-            - name: 安装Xvfb虚拟显示器
+            - name: 安装 Xvfb 虚拟显示器
               run: |
                   sudo apt-get update
                   sudo apt-get install -y xvfb
@@ -498,7 +665,7 @@ jobs:
                       msr-sessions-shard-${{ matrix.chunk.shard }}-
                       msr-sessions-
 
-            - name: 写入 .env.full
+            - name: 写入完整账号配置 .env.full
               env:
                   ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
               run: |
@@ -513,6 +680,8 @@ jobs:
 
                   echo "已写入 .env.full，共 $(grep -cE '^[[:space:]]*ACCOUNT_[0-9]+_EMAIL=' .env.full || true) 个账户邮箱行。"
 
+            # 根据完整账号列表做全局代理分配，
+            # 然后只输出当前 job 所负责的账号。
             - name: 按分片和代理规则生成 .env
               env:
                   SHARD: ${{ matrix.chunk.shard }}
@@ -538,12 +707,12 @@ jobs:
                       proxies = json.loads(proxies_json or "[]")
 
                       if not isinstance(proxies, list):
-                          raise ValueError("代理结果不是数组")
+                          raise ValueError("代理结果不是 JSON 数组")
 
                   except (json.JSONDecodeError, ValueError):
                       print(
-                          "::warning::代理结果格式无效，"
-                          "自动代理账号将使用本机 IP。"
+                          "::warning::代理测试结果格式无效，"
+                          "需要自动代理的账号将使用本机 IP。"
                       )
                       proxies = []
 
@@ -555,7 +724,7 @@ jobs:
                       re.IGNORECASE,
                   )
 
-                  # 匹配账号配置行，包括被注释的账号配置行。
+                  # 匹配包括注释行在内的账号配置。
                   account_line_re = re.compile(
                       r"^(\s*(?:#\s*)?)"
                       r"ACCOUNT_(\d+)_([A-Za-z0-9_]+)"
@@ -615,22 +784,22 @@ jobs:
                       active = entry["active"]
                       commented = entry["commented"]
 
-                      # 完整的未注释代理配置：保留。
+                      # 用户已经配置完整的未注释代理。
                       if (
                           active.get("URL", "") != ""
                           and active.get("PORT", "") != ""
                       ):
                           return "existing"
 
-                      # 未注释但为空或不完整：使用本机 IP。
+                      # 未注释代理行但为空或不完整。
                       if active:
                           return "disabled"
 
-                      # 被注释且有值：使用本机 IP。
+                      # 被注释代理行中有值。
                       if any(value != "" for value in commented.values()):
                           return "disabled"
 
-                      # 没有配置，或被注释且为空：自动代理。
+                      # 无代理行，或仅有被注释的空代理行。
                       return "auto"
 
                   statuses = {
@@ -650,14 +819,13 @@ jobs:
                   proxy_count = len(proxies)
 
                   if auto_count > 0 and proxy_count > 0:
-                      # 每 5 个账号使用一个代理时所需的代理数量。
+                      # 每 5 个自动代理账号使用一个 IP。
                       required_proxy_count = math.ceil(
                           auto_count / ACCOUNTS_PER_SHARD
                       )
 
                       if proxy_count >= required_proxy_count:
-                          # 代理数量充足：
-                          # 只使用速度最快的 ceil(账号数 / 5) 个代理。
+                          # 代理足够时，仅使用速度最快的若干代理。
                           used_proxy_count = required_proxy_count
 
                           for position, account_id in enumerate(
@@ -671,9 +839,15 @@ jobs:
                                   proxies[proxy_index]
                               )
 
+                          print(
+                              f"代理充足：自动代理账号 {auto_count} 个，"
+                              f"可用代理 {proxy_count} 个，"
+                              f"使用速度最快的前 {used_proxy_count} 个代理，"
+                              "每 5 个账号共用一个代理。"
+                          )
+
                       else:
-                          # 代理数量不足：
-                          # 将全部可用代理尽量平均分配给需要代理的账号。
+                          # 代理不足时，所有代理尽量平均分配。
                           used_proxy_count = proxy_count
 
                           for position, account_id in enumerate(
@@ -692,16 +866,16 @@ jobs:
                                   proxies[proxy_index]
                               )
 
-                      print(
-                          f"需要自动代理的账号：{auto_count} 个；"
-                          f"可用代理：{proxy_count} 个；"
-                          f"实际使用代理：{used_proxy_count} 个。"
-                      )
+                          print(
+                              f"代理不足：自动代理账号 {auto_count} 个，"
+                              f"可用代理 {proxy_count} 个，"
+                              "所有可用代理将尽量平均分配。"
+                          )
 
                   elif auto_count > 0:
                       print(
-                          f"需要自动代理的账号：{auto_count} 个；"
-                          "没有可用代理，这些账号将使用本机 IP。"
+                          f"自动代理账号 {auto_count} 个，但没有可用代理；"
+                          "这些账号将使用 GitHub Actions Runner 本机 IP。"
                       )
 
                   else:
@@ -714,17 +888,17 @@ jobs:
 
                   if not selected_ids:
                       raise SystemExit(
-                          f"分片 {shard} 没有可运行的账号"
+                          f"分片 {shard} 没有可运行的账号。"
                       )
 
-                  # 保留全局配置，例如 API_TOKEN 等。
                   output_lines = []
 
+                  # 保留非 ACCOUNT_N_ 开头的全局配置。
                   for line in lines:
                       match = account_line_re.match(line)
 
                       if match:
-                          # 所有账号行稍后重新生成。
+                          # 所有账号配置将在后续按当前分片重建。
                           continue
 
                       output_lines.append(line)
@@ -732,8 +906,9 @@ jobs:
                   if output_lines and output_lines[-1] != "":
                       output_lines.append("")
 
-                  # 将当前分片账号重排为 ACCOUNT_1、ACCOUNT_2……
+                  # 当前分片账号重新编号为 ACCOUNT_1、ACCOUNT_2……
                   for new_id, old_id in enumerate(selected_ids, start=1):
+                      # 复制账号普通配置；旧代理配置统一跳过。
                       for line in lines:
                           match = account_line_re.match(line)
 
@@ -746,7 +921,6 @@ jobs:
                           if line_account_id != old_id:
                               continue
 
-                          # 原代理行统一删除，之后根据规则重新写入。
                           if field.upper() in {
                               "PROXY_URL",
                               "PROXY_PORT",
@@ -763,7 +937,7 @@ jobs:
                       status = statuses[old_id]
 
                       if status == "existing":
-                          # 保留用户已经配置好的代理。
+                          # 原本有完整代理：保留。
                           active = proxy_entries[old_id]["active"]
 
                           output_lines.append(
@@ -776,13 +950,13 @@ jobs:
                               f"{active['PORT']}"
                           )
 
-                          action = "保留用户代理"
+                          action = "保留用户已有代理"
 
                       elif (
                           status == "auto"
                           and old_id in automatic_assignments
                       ):
-                          # 写入自动分配的代理。
+                          # 自动添加测速通过的代理。
                           proxy = automatic_assignments[old_id]
 
                           protocol = str(
@@ -791,9 +965,14 @@ jobs:
 
                           ip = str(proxy["ip"]).strip()
                           port = int(proxy["port"])
+                          adr = str(proxy.get("adr", "未知地区"))
+                          latency = proxy.get("latency")
 
-                          # IPv6 地址在代理 URL 中需要方括号。
-                          host = f"[{ip}]" if ":" in ip else ip
+                          host = (
+                              f"[{ip}]"
+                              if ":" in ip and not ip.startswith("[")
+                              else ip
+                          )
 
                           output_lines.append(
                               f"ACCOUNT_{new_id}_PROXY_URL="
@@ -804,14 +983,26 @@ jobs:
                               f"ACCOUNT_{new_id}_PROXY_PORT={port}"
                           )
 
-                          action = "使用自动代理"
+                          latency_text = (
+                              f"{float(latency):.3f}s"
+                              if latency is not None
+                              else "未知"
+                          )
+
+                          action = (
+                              f"自动代理 "
+                              f"{protocol}://{ip}:{port} "
+                              f"地区={adr} "
+                              f"测速={latency_text}"
+                          )
 
                       elif status == "disabled":
-                          # 用户明确禁用代理，不写代理配置行。
+                          # 用户明确要求不用代理：
+                          # 不生成 PROXY_URL、PROXY_PORT 两行。
                           action = "按用户配置使用本机 IP"
 
                       else:
-                          # 没有可用代理，不写代理配置行。
+                          # 自动代理账号，但没有可用代理。
                           action = "无可用代理，使用本机 IP"
 
                       output_lines.append("")
@@ -840,7 +1031,7 @@ jobs:
 
                   echo "当前分片 .env 已生成。"
                   echo "当前分片账号数：$(grep -cE '^[[:space:]]*ACCOUNT_[0-9]+_EMAIL=' .env || true)"
-                  echo "当前分片代理数：$(grep -cE '^[[:space:]]*ACCOUNT_[0-9]+_PROXY_URL=.+$' .env || true)"
+                  echo "当前分片启用代理数：$(grep -cE '^[[:space:]]*ACCOUNT_[0-9]+_PROXY_URL=.+$' .env || true)"
 
             - name: 构建 config.json
               env:
@@ -866,11 +1057,13 @@ jobs:
                   mv "$tmp" config.json
 
                   if [ "${INPUT_DEBUG_LOGS}" = "true" ]; then
+                    tmp=$(mktemp)
                     jq '.debugLogs = true' config.json > "$tmp"
                     mv "$tmp" config.json
                   fi
 
                   if [ "${INPUT_RUN_ON_ZERO_POINTS}" = "true" ]; then
+                    tmp=$(mktemp)
                     jq '.searchSettings.runOnZeroPoints = true' config.json > "$tmp"
                     mv "$tmp" config.json
                   fi

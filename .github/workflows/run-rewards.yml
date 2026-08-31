@@ -1,0 +1,673 @@
+name: 运行 Microsoft Rewards
+
+# 本工作流按计划（以及按需）运行 Microsoft Rewards 脚本。
+# 它不运行存储本工作流文件的仓库代码，
+# 而是检出 zhangMonday/Microsoft-Rewards-Script@v4 并运行。
+#
+# 所需的 secrets/variables 详见 .github/workflows/README.md。
+
+on:
+    # 手动触发，支持运行时覆盖参数。
+    workflow_dispatch:
+        inputs:
+            debug_logs:
+                description: '强制本次运行启用 debugLogs=true'
+                type: boolean
+                default: false
+            run_on_zero_points:
+                description: '强制本次运行启用 searchSettings.runOnZeroPoints=true'
+                type: boolean
+                default: false
+    # 定时运行。Cron 为 UTC 时间。默认：每天 UTC 07:11 和 19:11。
+    # 编辑/添加行以更改计划。
+    schedule:
+        - cron: '11 7 * * *'
+        - cron: '11 19 * * *'
+
+# 不同时运行两个 rewards 任务（sessions.db 会冲突）。
+concurrency:
+    group: run-microsoft-rewards
+    cancel-in-progress: false
+
+permissions:
+    contents: read
+
+jobs:
+    # 前置 job：统计 ACCOUNTS_ENV 中的账号数量，按每 5 个账号一片计算分片数，
+    # 输出动态 matrix，供 run job 并行执行。<=5 个账号时只输出 1 个分片，行为不变。
+    prepare:
+        name: 计算账号分片
+        runs-on: ubuntu-latest
+        outputs:
+            shards: ${{ steps.split.outputs.shards }}
+            total: ${{ steps.split.outputs.total }}
+        steps:
+            - name: 统计账号数量并生成分片矩阵
+              id: split
+              env:
+                  ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "${ACCOUNTS_ENV:-}" ]; then
+                    echo "::error::Secret ACCOUNTS_ENV 为空。请添加 ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD（等）到其中。"
+                    exit 1
+                  fi
+                  printf '%s\n' "$ACCOUNTS_ENV" > .env.full
+                  TOTAL=$(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
+                  if [ "$TOTAL" -eq 0 ]; then
+                    echo "::error::ACCOUNTS_ENV 中未找到任何 ACCOUNT_N_EMAIL 配置。"
+                    exit 1
+                  fi
+                  # 每 5 个账号一个 job，向上取整，数量不设上限。
+                  SHARDS=$(( (TOTAL + 4) / 5 ))
+                  echo "账号总数: ${TOTAL}，分片（job）数: ${SHARDS}"
+                  SHARDS_JSON=$(jq -cn --argjson n "$SHARDS" '[range(0; $n) | {shard: ., display: "\(.+1)/\($n)"}]')
+                  echo "shards=${SHARDS_JSON}" >> "$GITHUB_OUTPUT"
+                  echo "total=${TOTAL}" >> "$GITHUB_OUTPUT"
+
+    run:
+        name: 运行 rewards（分片 ${{ matrix.chunk.display }}）
+        needs: prepare
+        runs-on: ubuntu-latest
+
+        strategy:
+            # 某个分片失败不影响其他分片继续执行。
+            fail-fast: false
+            matrix:
+                chunk: ${{ fromJSON(needs.prepare.outputs.shards) }}
+
+        env:
+            # 实际运行的源仓库（不是存储本工作流的仓库）。
+            SOURCE_REPO: zhangMonday/Microsoft-Rewards-Script
+            SOURCE_REF: v4
+
+        steps:
+            # 1. 检出源仓库，而非当前仓库。
+            - name: 检出源仓库
+              uses: actions/checkout@v7
+              with:
+                  repository: ${{ env.SOURCE_REPO }}
+                  ref: ${{ env.SOURCE_REF }}
+                  # 用于源仓库的 PAT，需具有 'repo' 范围（经典）或细粒度 Contents: Read 权限。
+                  token: ${{ secrets.SOURCE_REPO_TOKEN }}
+                  persist-credentials: false
+
+            - name: 设置时区为北京时间
+              run: |
+                  set -euo pipefail
+                  sudo timedatectl set-timezone Asia/Shanghai
+                  echo "当前时间: $(date)"
+
+            - name: 下载中文字体
+              run: |
+                  set -euo pipefail
+
+                  for ATTEMPT in 1 2 3 4 5; do
+                    if sudo apt-get \
+                      -o Acquire::Retries=5 \
+                      -o Acquire::ForceIPv4=true \
+                      -o Acquire::http::Timeout=30 \
+                      -o Acquire::https::Timeout=30 \
+                      update; then
+                      break
+                    fi
+
+                    if [ "$ATTEMPT" -eq 5 ]; then
+                      echo "::error::apt-get update 失败。"
+                      exit 1
+                    fi
+
+                    echo "apt-get update 失败，第 ${ATTEMPT} 次，10 秒后重试。"
+                    sleep 10
+                  done
+
+                  for ATTEMPT in 1 2 3 4 5; do
+                    if sudo apt-get \
+                      -o Acquire::Retries=5 \
+                      -o Acquire::ForceIPv4=true \
+                      -o Acquire::http::Timeout=30 \
+                      -o Acquire::https::Timeout=30 \
+                      install -y fonts-wqy-zenhei; then
+                      echo "中文字体安装成功。"
+                      break
+                    fi
+
+                    if [ "$ATTEMPT" -eq 5 ]; then
+                      echo "::error::fonts-wqy-zenhei 安装失败。"
+                      exit 1
+                    fi
+
+                    echo "中文字体安装失败，第 ${ATTEMPT} 次，10 秒后重试。"
+                    sleep 10
+                  done
+
+            - name: 安装Xvfb虚拟显示器
+              run: |
+                  set -euo pipefail
+
+                  for ATTEMPT in 1 2 3; do
+                    if sudo apt-get \
+                      -o Acquire::Retries=5 \
+                      -o Acquire::ForceIPv4=true \
+                      -o Acquire::http::Timeout=30 \
+                      -o Acquire::https::Timeout=30 \
+                      install -y xvfb; then
+                      echo "Xvfb 安装成功。"
+                      break
+                    fi
+
+                    if [ "$ATTEMPT" -eq 3 ]; then
+                      echo "::error::Xvfb 安装失败。"
+                      exit 1
+                    fi
+
+                    echo "Xvfb 安装失败，第 ${ATTEMPT} 次，10 秒后重试。"
+                    sleep 10
+                  done
+
+            - name: 启动虚拟显示器
+              run: |
+                  set -euo pipefail
+
+                  Xvfb :99 -screen 0 1024x768x24 &
+                  XVFB_PID=$!
+
+                  echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+                  sleep 2
+
+                  if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+                    echo "::error::Xvfb 启动失败。"
+                    exit 1
+                  fi
+
+                  echo "Xvfb 已启动，DISPLAY=:99"
+
+            # 2. Node.js 24（脚本的 package.json engines 字段要求）。
+            - name: 设置 Node.js
+              uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+                  cache: npm
+
+            # 3. 安装依赖（跳过生命周期脚本；浏览器将单独安装）。
+            - name: 安装依赖
+              run: npm ci --ignore-scripts
+
+            # 4. 在运行间缓存 Patchright/Chromium 浏览器下载。
+            - name: 缓存 Patchright 浏览器
+              id: browser-cache
+              uses: actions/cache@v6
+              with:
+                  path: ~/.cache/ms-playwright
+                  key: patchright-chromium-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+                  restore-keys: |
+                      patchright-chromium-${{ runner.os }}-
+
+            - name: 安装 Chromium（含系统依赖）
+              run: npx patchright install --with-deps chromium
+
+            # 5. 从上次运行恢复登录会话，避免重复 2FA/登录。
+            #    缓存以运行编号 + 分片号为键，每个分片（job）独立读写自己的会话缓存，
+            #    避免并行分片之间互相覆盖；并兼容恢复旧的未分片缓存。
+            - name: 恢复会话
+              id: sessions-cache
+              uses: actions/cache@v6
+              with:
+                  path: sessions
+                  key: msr-sessions-shard-${{ matrix.chunk.shard }}-${{ github.run_id }}
+                  restore-keys: |
+                      msr-sessions-shard-${{ matrix.chunk.shard }}-
+                      msr-sessions-
+
+            # 6. 将账户凭据从 ACCOUNTS_ENV secret 写入 .env.full（完整账号列表）。
+            #    ACCOUNTS_ENV 包含完整的 .env 文件内容（ACCOUNT_1_EMAIL=... 等）。
+            - name: 写入 .env.full
+              env:
+                  ACCOUNTS_ENV: ${{ secrets.ACCOUNTS_ENV }}
+              run: |
+                  set -euo pipefail
+
+                  if [ -z "${ACCOUNTS_ENV:-}" ]; then
+                    echo "::error::Secret ACCOUNTS_ENV 为空。请添加 ACCOUNT_1_EMAIL / ACCOUNT_1_PASSWORD（等）到其中。"
+                    exit 1
+                  fi
+
+                  printf '%s\n' "$ACCOUNTS_ENV" > .env.full
+                  echo "已写入 .env.full，共 $(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true) 个账户邮箱行。"
+
+            # Tailscale 的 OAuth Client 用于创建 GitHub Actions 临时节点。
+            # 不使用 Exit Node，也不接受 Tailscale DNS，避免影响 GitHub Actions 网络请求。
+            - name: 连接 Tailscale
+              uses: tailscale/github-action@v4
+              with:
+                  oauth-client-id: ${{ secrets.TAILSCALE_OAUTH_CLIENT_ID }}
+                  oauth-secret: ${{ secrets.TAILSCALE_OAUTH_SECRET }}
+                  tags: tag:github-actions
+
+            - name: 限制 Tailscale 网络设置
+              run: |
+                  set -euo pipefail
+
+                  sudo tailscale set \
+                    --accept-dns=false \
+                    --exit-node=
+
+                  echo "Tailscale 当前状态："
+                  tailscale status
+
+                  echo "Tailscale IPv4："
+                  tailscale ip -4
+
+            # 测试默认 SOCKS5 代理。
+            # 测试失败时，需要默认代理的账号将直接使用本地 IP。
+            - name: 测试默认 SOCKS5 代理
+              id: test-default-proxy
+              env:
+                  DEFAULT_PROXY_URL: socks5://100.91.170.46
+                  DEFAULT_PROXY_PORT: "1217"
+              run: |
+                  set -u
+
+                  PROXY_HOST="${DEFAULT_PROXY_URL#socks5://}"
+                  PROXY="${PROXY_HOST}:${DEFAULT_PROXY_PORT}"
+
+                  echo "开始测试 SOCKS5 代理 ${PROXY}"
+
+                  SUCCESS=0
+
+                  TEST_URLS=(
+                    "https://www.microsoft.com/robots.txt"
+                    "https://login.live.com/"
+                    "https://login.microsoftonline.com/"
+                  )
+
+                  for ATTEMPT in 1 2 3 4 5; do
+                    echo "代理测试，第 ${ATTEMPT}/5 次"
+                    ATTEMPT_SUCCESS=0
+
+                    for TEST_URL in "${TEST_URLS[@]}"; do
+                      echo "测试地址: ${TEST_URL}"
+
+                      if curl \
+                        --fail \
+                        --silent \
+                        --show-error \
+                        --location \
+                        --max-time 25 \
+                        --connect-timeout 12 \
+                        --proxy "socks5h://${PROXY}" \
+                        -A "Mozilla/5.0" \
+                        "$TEST_URL" \
+                        -o /dev/null; then
+                        echo "访问成功: ${TEST_URL}"
+                        ATTEMPT_SUCCESS=1
+                      else
+                        echo "访问失败: ${TEST_URL}"
+                      fi
+                    done
+
+                    if [ "$ATTEMPT_SUCCESS" -eq 1 ]; then
+                      SUCCESS=1
+                      echo "默认 SOCKS5 代理测试成功。"
+                      break
+                    fi
+
+                    echo "第 ${ATTEMPT} 次代理测试失败。"
+
+                    if [ "$ATTEMPT" -lt 5 ]; then
+                      sleep 8
+                    fi
+                  done
+
+                  if [ "$SUCCESS" -eq 1 ]; then
+                    echo "DEFAULT_PROXY_AVAILABLE=true" >> "$GITHUB_ENV"
+                    echo "available=true" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "::warning::默认 SOCKS5 代理不可用。需要自动添加代理的账号将使用本地 IP。"
+                    echo "DEFAULT_PROXY_AVAILABLE=false" >> "$GITHUB_ENV"
+                    echo "available=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            # 根据每个账号原有的代理配置，补充、保留或删除代理配置。
+            - name: 处理账号代理配置
+              env:
+                  DEFAULT_PROXY_URL: socks5://100.91.170.46
+                  DEFAULT_PROXY_PORT: "1217"
+              run: |
+                  set -euo pipefail
+
+                  python3 <<'PY'
+                  import os
+                  import re
+                  from collections import defaultdict
+
+                  input_file = ".env.full"
+                  temporary_file = ".env.full.processed"
+
+                  default_proxy_url = os.environ["DEFAULT_PROXY_URL"]
+                  default_proxy_port = os.environ["DEFAULT_PROXY_PORT"]
+
+                  proxy_available = (
+                      os.environ.get(
+                          "DEFAULT_PROXY_AVAILABLE",
+                          "false"
+                      ).lower() == "true"
+                  )
+
+                  account_email_re = re.compile(
+                      r"^ACCOUNT_(\d+)_EMAIL="
+                  )
+
+                  proxy_re = re.compile(
+                      r"^(\s*#\s*)?ACCOUNT_(\d+)_(PROXY_URL|PROXY_PORT)=(.*)$"
+                  )
+
+                  with open(input_file, "r", encoding="utf-8") as file:
+                      lines = file.readlines()
+
+                  account_ids = []
+
+                  for line in lines:
+                      match = account_email_re.match(line.rstrip("\n"))
+
+                      if match:
+                          account_ids.append(int(match.group(1)))
+
+                  account_ids = sorted(set(account_ids))
+
+                  proxy_records = defaultdict(dict)
+
+                  for line in lines:
+                      match = proxy_re.match(line.rstrip("\n"))
+
+                      if not match:
+                          continue
+
+                      comment_prefix, account_id, field, value = match.groups()
+                      account_id = int(account_id)
+
+                      proxy_records[account_id][field] = {
+                          "commented": bool(comment_prefix),
+                          "value": value.strip(),
+                      }
+
+                  def get_proxy_decision(account_id):
+                      records = proxy_records.get(account_id, {})
+
+                      url_record = records.get("PROXY_URL")
+                      port_record = records.get("PROXY_PORT")
+
+                      # 已配置有效且未注释的代理，保留账号自己的代理。
+                      if (
+                          url_record
+                          and port_record
+                          and not url_record["commented"]
+                          and not port_record["commented"]
+                          and url_record["value"]
+                          and port_record["value"]
+                      ):
+                          return "configured"
+
+                      # 未注释但为空或配置不完整，明确使用本地 IP。
+                      if any(
+                          record and not record["commented"]
+                          for record in (url_record, port_record)
+                      ):
+                          return "local"
+
+                      # 注释且带有值，明确使用本地 IP。
+                      if any(
+                          record
+                          and record["commented"]
+                          and record["value"]
+                          for record in (url_record, port_record)
+                      ):
+                          return "local"
+
+                      # 没有配置，或注释且为空，使用默认代理。
+                      return "default"
+
+                  decisions = {
+                      account_id: get_proxy_decision(account_id)
+                      for account_id in account_ids
+                  }
+
+                  print("账号代理策略：")
+
+                  for account_id in account_ids:
+                      print(
+                          f"ACCOUNT_{account_id}: "
+                          f"{decisions[account_id]}"
+                      )
+
+                  # 删除原有代理行，后续按策略重新写入。
+                  filtered_lines = []
+
+                  for line in lines:
+                      if proxy_re.match(line.rstrip("\n")):
+                          continue
+
+                      filtered_lines.append(line)
+
+                  account_last_index = {}
+
+                  for index, line in enumerate(filtered_lines):
+                      match = re.match(
+                          r"^ACCOUNT_(\d+)_",
+                          line.rstrip("\n")
+                      )
+
+                      if match:
+                          account_last_index[int(match.group(1))] = index
+
+                  additions = defaultdict(list)
+
+                  for account_id in account_ids:
+                      decision = decisions[account_id]
+
+                      if decision == "configured":
+                          continue
+
+                      if decision == "local":
+                          continue
+
+                      if decision == "default":
+                          if not proxy_available:
+                              print(
+                                  f"ACCOUNT_{account_id}: "
+                                  "默认代理不可用，使用本地 IP"
+                              )
+                              continue
+
+                          if account_id not in account_last_index:
+                              raise RuntimeError(
+                                  f"找不到 ACCOUNT_{account_id} 的配置块"
+                              )
+
+                          index = account_last_index[account_id]
+
+                          additions[index].extend([
+                              (
+                                  f"ACCOUNT_{account_id}_PROXY_URL="
+                                  f"{default_proxy_url}\n"
+                              ),
+                              (
+                                  f"ACCOUNT_{account_id}_PROXY_PORT="
+                                  f"{default_proxy_port}\n"
+                              ),
+                          ])
+
+                  # 恢复已经配置好的账号专属代理。
+                  for account_id in account_ids:
+                      if decisions[account_id] != "configured":
+                          continue
+
+                      url_record = proxy_records[account_id]["PROXY_URL"]
+                      port_record = proxy_records[account_id]["PROXY_PORT"]
+
+                      if account_id not in account_last_index:
+                          raise RuntimeError(
+                              f"找不到 ACCOUNT_{account_id} 的配置块"
+                          )
+
+                      index = account_last_index[account_id]
+
+                      additions[index].extend([
+                          (
+                              f"ACCOUNT_{account_id}_PROXY_URL="
+                              f"{url_record['value']}\n"
+                          ),
+                          (
+                              f"ACCOUNT_{account_id}_PROXY_PORT="
+                              f"{port_record['value']}\n"
+                          ),
+                      ])
+
+                  output_lines = []
+
+                  for index, line in enumerate(filtered_lines):
+                      output_lines.append(line)
+
+                      if index in additions:
+                          output_lines.extend(additions[index])
+
+                  with open(temporary_file, "w", encoding="utf-8") as file:
+                      file.writelines(output_lines)
+
+                  os.replace(temporary_file, input_file)
+                  PY
+
+                  echo "账号代理配置处理完成。"
+
+                  # 只输出代理配置行，不输出邮箱、密码和 TOTP Secret。
+                  echo "最终代理配置："
+
+                  grep -E \
+                    '^(ACCOUNT_[0-9]+_PROXY_URL|ACCOUNT_[0-9]+_PROXY_PORT)=' \
+                    .env.full || true
+
+            # 6b. 按分片拆分账号配置：每个 job 只保留属于自己的账号（按邮箱行排序后每 5 个一片），
+            #     并重排为 ACCOUNT_1..N，非账号行（如 API_TOKEN 等其他配置）原样保留。
+            #     单分片（<=5 个账号）时不做拆分，与原有单 job 逻辑完全一致。
+            - name: 按分片生成 .env
+              env:
+                  SHARD: ${{ matrix.chunk.shard }}
+              run: |
+                  set -euo pipefail
+
+                  TOTAL=$(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
+                  SHARDS=$(( (TOTAL + 4) / 5 ))
+
+                  if [ "$SHARDS" -le 1 ]; then
+                    cp .env.full .env
+                    echo "账号数 ${TOTAL} <= 5，单 job 运行，.env 不做拆分。"
+                  else
+                    mapfile -t ACCTS < <(
+                      grep -oE '^ACCOUNT_[0-9]+_EMAIL=' .env.full \
+                        | sed -E 's/^ACCOUNT_([0-9]+)_EMAIL=/\1/' \
+                        | sort -nu
+                    )
+
+                    START=$((SHARD * 5))
+
+                    grep -vE '^ACCOUNT_[0-9]+_' .env.full > .env || true
+
+                    NEW=1
+
+                    for OLD in "${ACCTS[@]:$START:5}"; do
+                      grep -E "^ACCOUNT_${OLD}_" .env.full \
+                        | sed -E "s/^ACCOUNT_${OLD}_/ACCOUNT_${NEW}_/" \
+                        >> .env
+
+                      echo "  原账号槽位 ${OLD} -> 本 job 槽位 ${NEW}"
+
+                      NEW=$((NEW + 1))
+                    done
+
+                    echo "分片 $((SHARD + 1))/${SHARDS}：总账号 ${TOTAL} 个，本 job 负责 $((NEW - 1)) 个。"
+                  fi
+
+                  echo "当前分片实际代理配置："
+
+                  grep -E \
+                    '^(ACCOUNT_[0-9]+_PROXY_URL|ACCOUNT_[0-9]+_PROXY_PORT)=' \
+                    .env || true
+
+            # 7. 构建 config.json。
+            #    - 如果设置了 CONFIG_JSON variable/secret，则原样使用（支持所有配置选项）。
+            #    - 否则使用仓库的 config.example.json 作为基础。
+            #    然后强制设置 CI 中必须不同的参数（headless、diagnostics），
+            #    并应用可选的 workflow_dispatch 覆盖参数。
+            - name: 构建 config.json
+              env:
+                  CONFIG_JSON: ${{ vars.CONFIG_JSON != '' && vars.CONFIG_JSON || secrets.CONFIG_JSON }}
+                  INPUT_DEBUG_LOGS: ${{ inputs.debug_logs }}
+                  INPUT_RUN_ON_ZERO_POINTS: ${{ inputs.run_on_zero_points }}
+              run: |
+                  set -euo pipefail
+
+                  if [ -n "${CONFIG_JSON:-}" ]; then
+                    printf '%s' "$CONFIG_JSON" > config.json
+                    echo "使用来自仓库 variable/secret 的 CONFIG_JSON。"
+                  else
+                    cp config.example.json config.json
+                    echo "未设置 CONFIG_JSON；使用 config.example.json 作为基础。"
+                  fi
+
+                  # 提前验证 JSON 格式。
+                  jq empty config.json
+
+                  # 保留 config.json 中的 headless 设置；Xvfb 仅提供可选的虚拟显示环境。
+                  tmp=$(mktemp)
+
+                  jq '.errorDiagnostics = true' config.json \
+                    > "$tmp" && mv "$tmp" config.json
+
+                  if [ "${INPUT_DEBUG_LOGS}" = "true" ]; then
+                    jq '.debugLogs = true' config.json \
+                      > "$tmp" && mv "$tmp" config.json
+                  fi
+
+                  if [ "${INPUT_RUN_ON_ZERO_POINTS}" = "true" ]; then
+                    jq '.searchSettings.runOnZeroPoints = true' config.json \
+                      > "$tmp" && mv "$tmp" config.json
+                  fi
+
+            # 8. 构建并运行。
+            - name: 构建
+              run: npm run build
+
+            - name: 运行 Microsoft Rewards 脚本
+              run: npm start
+
+            - name: 关闭 Tailscale
+              if: always()
+              continue-on-error: true
+              run: |
+                  echo "正在关闭 Tailscale……"
+
+                  sudo tailscale down || true
+                  sudo systemctl stop tailscaled || true
+
+                  echo "Tailscale 已关闭。"
+
+            # 9. 持久化更新后的会话以供下次运行使用。
+            - name: 保存会话
+              if: always()
+              uses: actions/cache/save@v6
+              with:
+                  path: sessions
+                  key: msr-sessions-shard-${{ matrix.chunk.shard }}-${{ github.run_id }}
+
+            # 10. 上传诊断/日志文件用于故障排查（保留 7 天）。
+            - name: 上传诊断信息
+              if: always()
+              uses: actions/upload-artifact@v6
+              with:
+                  name: rewards-diagnostics-${{ github.run_id }}-shard${{ matrix.chunk.shard }}
+                  path: |
+                      diagnostics/
+                      *.log
+                  if-no-files-found: ignore
+                  retention-days: 7

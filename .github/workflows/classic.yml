@@ -28,8 +28,8 @@ permissions:
     contents: read
 
 jobs:
-    # 前置 job：统计 ACCOUNTS_ENV 中的账号数量，按每 5 个账号一片计算分片数，
-    # 输出动态 matrix，供 run job 并行执行。<=5 个账号时只输出 1 个分片，行为不变。
+    # 前置 job：统计 ACCOUNTS_ENV 中的账号数量，按每 4 个账号一片计算分片数，
+    # 输出动态 matrix，供 run job 并行执行。<=4 个账号时只输出 1 个分片，行为不变。
     prepare:
         name: 计算账号分片
         runs-on: ubuntu-latest
@@ -53,8 +53,8 @@ jobs:
                     echo "::error::ACCOUNTS_ENV 中未找到任何 ACCOUNT_N_EMAIL 配置。"
                     exit 1
                   fi
-                  # 每 5 个账号一个 job，向上取整，数量不设上限。
-                  SHARDS=$(( (TOTAL + 4) / 5 ))
+                  # 每 4 个账号一个 job，向上取整，数量不设上限。
+                  SHARDS=$(( (TOTAL + 3) / 4 ))
                   echo "账号总数: ${TOTAL}，分片（job）数: ${SHARDS}"
                   SHARDS_JSON=$(jq -cn --argjson n "$SHARDS" '[range(0; $n) | {shard: ., display: "\(.+1)/\($n)"}]')
                   echo "shards=${SHARDS_JSON}" >> "$GITHUB_OUTPUT"
@@ -540,9 +540,9 @@ jobs:
                     '^(ACCOUNT_[0-9]+_PROXY_URL|ACCOUNT_[0-9]+_PROXY_PORT)=' \
                     .env.full || true
 
-            # 6b. 按分片拆分账号配置：每个 job 只保留属于自己的账号（按邮箱行排序后每 5 个一片），
+            # 6b. 按分片拆分账号配置：每个 job 只保留属于自己的账号（按邮箱行排序后每 4 个一片），
             #     并重排为 ACCOUNT_1..N，非账号行（如 API_TOKEN 等其他配置）原样保留。
-            #     单分片（<=5 个账号）时不做拆分，与原有单 job 逻辑完全一致。
+            #     单分片（<=4 个账号）时不做拆分，与原有单 job 逻辑完全一致。
             - name: 按分片生成 .env
               env:
                   SHARD: ${{ matrix.chunk.shard }}
@@ -550,11 +550,11 @@ jobs:
                   set -euo pipefail
 
                   TOTAL=$(grep -cE '^ACCOUNT_[0-9]+_EMAIL=' .env.full || true)
-                  SHARDS=$(( (TOTAL + 4) / 5 ))
+                  SHARDS=$(( (TOTAL + 3) / 4 ))
 
                   if [ "$SHARDS" -le 1 ]; then
                     cp .env.full .env
-                    echo "账号数 ${TOTAL} <= 5，单 job 运行，.env 不做拆分。"
+                    echo "账号数 ${TOTAL} <= 4，单 job 运行，.env 不做拆分。"
                   else
                     mapfile -t ACCTS < <(
                       grep -oE '^ACCOUNT_[0-9]+_EMAIL=' .env.full \
@@ -562,13 +562,13 @@ jobs:
                         | sort -nu
                     )
 
-                    START=$((SHARD * 5))
+                    START=$((SHARD * 4))
 
                     grep -vE '^ACCOUNT_[0-9]+_' .env.full > .env || true
 
                     NEW=1
 
-                    for OLD in "${ACCTS[@]:$START:5}"; do
+                    for OLD in "${ACCTS[@]:$START:4}"; do
                       grep -E "^ACCOUNT_${OLD}_" .env.full \
                         | sed -E "s/^ACCOUNT_${OLD}_/ACCOUNT_${NEW}_/" \
                         >> .env

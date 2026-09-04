@@ -18,10 +18,11 @@ on:
                 description: '强制本次运行启用 searchSettings.runOnZeroPoints=true'
                 type: boolean
                 default: false
-    # 定时运行。Cron 为 UTC 时间。默认：每天 UTC 07:11 和 19:11。
+    # 定时运行。Cron 为 UTC 时间。默认：每天 UTC 07:11 13:11 和 19:11。
     # 编辑/添加行以更改计划。
     schedule:
         - cron: '11 7 * * *'
+        - cron: '11 13 * * *'
         - cron: '11 19 * * *'
 
 # 不同时运行两个 rewards 任务（sessions.db 会冲突）。

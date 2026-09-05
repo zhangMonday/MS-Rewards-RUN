@@ -664,3 +664,91 @@ jobs:
                       *.log
                   if-no-files-found: ignore
                   retention-days: 7
+
+    # ==================================================================================
+    # 收尾：检查并按需将本仓库闭源
+    # 无论前序 job 成功/失败/取消，本 job 均会执行
+    # ==================================================================================
+    finalize:
+        name: 收尾闭源检查
+        needs: [prepare, run]
+        runs-on: ubuntu-latest
+        if: always()
+        env:
+            MY_GITHUB_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
+            CURRENT_REPO: ${{ github.repository }}
+            CURRENT_RUN_ID: ${{ github.run_id }}
+
+        steps:
+            - name: '检查其他工作流并按需闭源本仓库'
+              shell: python
+              run: |
+                  import os
+                  import time
+                  import urllib.request
+                  import urllib.error
+                  import json
+
+                  token       = os.environ['MY_GITHUB_TOKEN']
+                  repo        = os.environ['CURRENT_REPO']
+                  current_run = str(os.environ['CURRENT_RUN_ID'])
+
+                  headers = {
+                      'Authorization': f'token {token}',
+                      'Accept': 'application/vnd.github+json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                  }
+
+                  def gh_request(method, path, body=None):
+                      url = f'https://api.github.com{path}'
+                      data = json.dumps(body).encode() if body else None
+                      req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                      with urllib.request.urlopen(req) as resp:
+                          return json.loads(resp.read().decode())
+
+                  # ------------------------------------------------------------------
+                  # 1. 查询本仓库中所有「运行中」或「排队中」的工作流（排除本次运行）
+                  # ------------------------------------------------------------------
+                  print("正在查询本仓库其他工作流运行状态...")
+                  other_active = []
+                  for status in ('in_progress', 'queued'):
+                      page = 1
+                      while True:
+                          result = gh_request('GET', f'/repos/{repo}/actions/runs?status={status}&per_page=100&page={page}')
+                          runs = result.get('workflow_runs', [])
+                          if not runs:
+                              break
+                          for run in runs:
+                              if str(run['id']) != current_run:
+                                  other_active.append(run['id'])
+                          if len(runs) < 100:
+                              break
+                          page += 1
+
+                  if other_active:
+                      print(f"检测到 {len(other_active)} 个其他工作流正在运行或排队（ID: {other_active}），无需闭源，正常结束。")
+                  else:
+                      print("未检测到其他活跃工作流，准备将本仓库闭源...")
+
+                      # ----------------------------------------------------------------
+                      # 2. 尝试闭源，最多重试 3 次，每次间隔 30 秒
+                      # ----------------------------------------------------------------
+                      max_attempts = 3
+                      retry_delay  = 30   # 秒
+
+                      for attempt in range(1, max_attempts + 1):
+                          print(f"第 {attempt} 次尝试闭源...")
+                          try:
+                              result = gh_request('PATCH', f'/repos/{repo}', {'private': True})
+                              if result.get('private') is True:
+                                  print(f"✅ 第 {attempt} 次尝试成功，仓库已设为私有。")
+                                  break
+                              else:
+                                  raise ValueError(f"API 返回 private={result.get('private')}，闭源未生效。")
+                          except Exception as e:
+                              print(f"⚠️  第 {attempt} 次尝试失败：{e}")
+                              if attempt < max_attempts:
+                                  print(f"等待 {retry_delay} 秒后重试...")
+                                  time.sleep(retry_delay)
+                              else:
+                                  raise SystemExit(f"❌ 已尝试 {max_attempts} 次，全部失败，工作流报错退出。")

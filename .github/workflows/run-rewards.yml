@@ -259,7 +259,7 @@ jobs:
             - name: 测试默认 SOCKS5 代理
               id: test-default-proxy
               env:
-                  DEFAULT_PROXY_URL: socks5://100.91.170.46
+                  DEFAULT_PROXY_URL: socks5://100.93.207.15
                   DEFAULT_PROXY_PORT: "1217"
               run: |
                   set -u
@@ -327,7 +327,7 @@ jobs:
             # 根据每个账号原有的代理配置，补充、保留或删除代理配置。
             - name: 处理账号代理配置
               env:
-                  DEFAULT_PROXY_URL: socks5://100.91.170.46
+                  DEFAULT_PROXY_URL: socks5://100.93.207.15
                   DEFAULT_PROXY_PORT: "1217"
               run: |
                   set -euo pipefail
